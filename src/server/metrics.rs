@@ -29,6 +29,7 @@ make_static_metric! {
         kv_delete_range,
         raw_get,
         raw_batch_get,
+        raw_eval,
         raw_scan,
         raw_batch_scan,
         raw_put,

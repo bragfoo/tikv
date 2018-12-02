@@ -1057,6 +1057,64 @@ impl<E: Engine> Storage<E> {
             .flatten()
     }
 
+    pub fn async_raw_eval(
+        &self,
+        ctx: Context,
+        cf: String,
+        keys: Vec<Vec<u8>>,
+    ) -> impl Future<Item = Vec<Result<KvPair>>, Error = Error> {
+        const CMD: &str = "raw_eval";
+        let engine = self.get_engine();
+        let priority = readpool::Priority::from(ctx.get_priority());
+
+        let keys: Vec<Key> = keys.into_iter().map(Key::from_encoded).collect();
+
+        let res = self.read_pool.future_execute(priority, move |ctxd| {
+            let mut _timer = {
+                let ctxd = ctxd.clone();
+                let mut thread_ctx = ctxd.current_thread_context_mut();
+                thread_ctx.start_command_duration_timer(CMD, priority)
+            };
+
+            Self::async_snapshot(engine, &ctx)
+                .and_then(move |snapshot: E::Snap| {
+                    let mut thread_ctx = ctxd.current_thread_context_mut();
+                    let _t_process = thread_ctx.start_processing_read_duration_timer(CMD);
+                    let cf = Self::rawkv_cf(&cf)?;
+                    // no scan_count for this kind of op.
+                    let mut stats = Statistics::default();
+                    let result: Vec<Result<KvPair>> = keys
+                        .into_iter()
+                        .map(|k| {
+                            let v = snapshot.get_cf(cf, &k);
+                            (k, v)
+                        })
+                        .filter(|&(_, ref v)| !(v.is_ok() && v.as_ref().unwrap().is_none()))
+                        .map(|(k, v)| match v {
+                            Ok(Some(v)) => {
+                                stats.data.flow_stats.read_keys += 1;
+                                stats.data.flow_stats.read_bytes += k.as_encoded().len() + v.len();
+                                Ok((k.into_encoded(), v))
+                            }
+                            Err(e) => Err(Error::from(e)),
+                            _ => unreachable!(),
+                        })
+                        .collect();
+                    thread_ctx.collect_key_reads(CMD, stats.data.flow_stats.read_keys as u64);
+                    thread_ctx.collect_read_flow(ctx.get_region_id(), &stats);
+                    Ok(result)
+                })
+                .then(move |r| {
+                    _timer.observe_duration();
+                    r
+                })
+        });
+
+        future::result(res)
+            .map_err(|_| Error::SchedTooBusy)
+            .flatten()
+    }
+
     pub fn async_raw_batch_get(
         &self,
         ctx: Context,
@@ -1249,6 +1307,7 @@ impl<E: Engine> Storage<E> {
         Ok(())
     }
 
+    
     fn raw_scan(
         snapshot: &E::Snap,
         cf: &str,

@@ -575,6 +575,42 @@ impl<T: RaftStoreRouter + 'static, E: Engine> tikvpb_grpc::Tikv for Service<T, E
         ctx.spawn(future);
     }
 
+    fn raw_eval(
+        &mut self,
+        ctx: RpcContext,
+        mut req: RawEvalRequest,
+        sink: UnarySink<RawEvalResponse>,
+    ) {
+        let timer = GRPC_MSG_HISTOGRAM_VEC.raw_eval.start_coarse_timer();
+
+        let script = req.take_script();
+        let num_keys = req.get_numkeys();
+        let keys = req.take_keys().into_vec();
+        let argv = req.take_keys().into_vec();
+        debug!("{} script:{} {:?} {:?} {:?}", "raw_eval",
+               script, num_keys, keys, argv);
+        let future = self
+            .storage
+            .async_raw_batch_get(req.take_context(), req.take_cf(), keys)
+            .then(|v| {
+                let mut resp = RawEvalResponse::new();
+                if let Some(err) = extract_region_error(&v) {
+                    resp.set_region_error(err);
+                } else {
+                    resp.set_pairs(RepeatedField::from_vec(extract_kv_pairs(v)));
+                }
+                sink.success(resp).map_err(Error::from)
+            })
+            .map(|_| timer.observe_duration())
+            .map_err(move |e| {
+                debug!("{} failed: {:?}", "raw_eval", e);
+                GRPC_MSG_FAIL_COUNTER.raw_eval.inc();
+            });
+
+        ctx.spawn(future);
+    }
+
+
     fn raw_scan(
         &mut self,
         ctx: RpcContext,
