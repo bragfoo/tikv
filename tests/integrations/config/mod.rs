@@ -1,34 +1,28 @@
-// Copyright 2017 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
 
-use rocksdb::{CompactionPriority, DBCompactionStyle, DBCompressionType, DBRecoveryMode};
 use slog::Level;
-use toml;
 
+use engine::rocks::util::config::{BlobRunMode, CompressionType};
+use engine::rocks::{
+    CompactionPriority, DBCompactionStyle, DBCompressionType, DBRateLimiterMode, DBRecoveryMode,
+};
+use pd_client::Config as PdConfig;
 use tikv::config::*;
 use tikv::import::Config as ImportConfig;
-use tikv::pd::Config as PdConfig;
 use tikv::raftstore::coprocessor::Config as CopConfig;
 use tikv::raftstore::store::Config as RaftstoreConfig;
 use tikv::server::config::GrpcCompressionType;
+use tikv::server::gc_worker::GcConfig;
 use tikv::server::Config as ServerConfig;
-use tikv::storage::Config as StorageConfig;
-use tikv::util::config::{ReadableDuration, ReadableSize};
-use tikv::util::security::SecurityConfig;
+use tikv::storage::config::{BlockCacheConfig, Config as StorageConfig};
+use tikv_util::config::{ReadableDuration, ReadableSize};
+use tikv_util::security::SecurityConfig;
+
+mod test_config_client;
 
 #[test]
 fn test_toml_serde() {
@@ -58,13 +52,16 @@ fn test_serde_custom_tikv_config() {
     value.server = ServerConfig {
         cluster_id: 0, // KEEP IT ZERO, it is skipped by serde.
         addr: "example.com:443".to_owned(),
-        labels: map!{ "a".to_owned() => "b".to_owned() },
+        labels: map! { "a".to_owned() => "b".to_owned() },
         advertise_addr: "example.com:443".to_owned(),
+        status_addr: "example.com:443".to_owned(),
+        status_thread_pool_size: 1,
         concurrent_send_snap_limit: 4,
         concurrent_recv_snap_limit: 4,
         grpc_compression_type: GrpcCompressionType::Gzip,
         grpc_concurrency: 123,
         grpc_concurrent_stream: 1_234,
+        grpc_memory_pool_quota: ReadableSize(123_456),
         grpc_raft_conn_num: 123,
         grpc_stream_initial_window_size: ReadableSize(12_345),
         grpc_keepalive_time: ReadableDuration::secs(3),
@@ -76,9 +73,16 @@ fn test_serde_custom_tikv_config() {
         end_point_stream_channel_size: 16,
         end_point_batch_row_limit: 64,
         end_point_stream_batch_row_limit: 4096,
+        end_point_enable_batch_if_possible: true,
         end_point_request_max_handle_duration: ReadableDuration::secs(12),
         snap_max_write_bytes_per_sec: ReadableSize::mb(10),
         snap_max_total_size: ReadableSize::gb(10),
+        stats_concurrency: 10,
+        heavy_load_threshold: 1000,
+        heavy_load_wait_duration: ReadableDuration::millis(2),
+        enable_request_batch: false,
+        request_batch_enable_cross_command: false,
+        request_batch_wait_duration: ReadableDuration::millis(10),
     };
     value.readpool = ReadPoolConfig {
         storage: StorageReadPoolConfig {
@@ -90,7 +94,7 @@ fn test_serde_custom_tikv_config() {
             max_tasks_per_worker_low: 2500,
             stack_size: ReadableSize::mb(20),
         },
-        coprocessor: CoprocessorReadPoolConfig {
+        coprocessor: CoprReadPoolConfig {
             high_concurrency: 2,
             normal_concurrency: 4,
             low_concurrency: 6,
@@ -123,6 +127,7 @@ fn test_serde_custom_tikv_config() {
         raft_log_gc_count_limit: 12,
         raft_log_gc_size_limit: ReadableSize::kb(1),
         raft_entry_cache_life_time: ReadableDuration::secs(12),
+        raft_reject_transfer_leader_duration: ReadableDuration::secs(3),
         split_region_check_tick_interval: ReadableDuration::secs(12),
         region_split_check_diff: ReadableSize::mb(6),
         region_compact_check_interval: ReadableDuration::secs(12),
@@ -156,9 +161,31 @@ fn test_serde_custom_tikv_config() {
         region_max_size: ReadableSize(0),
         region_split_size: ReadableSize(0),
         local_read_batch_size: 33,
+        apply_max_batch_size: 22,
+        apply_pool_size: 4,
+        store_max_batch_size: 21,
+        store_pool_size: 3,
+        future_poll_size: 2,
+        hibernate_regions: false,
     };
-    value.pd = PdConfig {
-        endpoints: vec!["example.com:443".to_owned()],
+    value.pd = PdConfig::new(vec!["example.com:443".to_owned()]);
+    let titan_cf_config = TitanCfConfig {
+        min_blob_size: ReadableSize(2018),
+        blob_file_compression: CompressionType::Zstd,
+        blob_cache_size: ReadableSize::gb(12),
+        min_gc_batch_size: ReadableSize::kb(12),
+        max_gc_batch_size: ReadableSize::mb(12),
+        discardable_ratio: 0.00156,
+        sample_ratio: 0.982,
+        merge_small_file_threshold: ReadableSize::kb(21),
+        blob_run_mode: BlobRunMode::Fallback,
+    };
+    let titan_db_config = TitanDBConfig {
+        enabled: true,
+        dirname: "bar".to_owned(),
+        disable_gc: false,
+        max_background_gc: 9,
+        purge_obsolete_files_period: ReadableDuration::secs(1),
     };
     value.rocksdb = DbConfig {
         wal_recovery_mode: DBRecoveryMode::AbsoluteConsistency,
@@ -178,12 +205,15 @@ fn test_serde_custom_tikv_config() {
         info_log_keep_log_file_num: 1000,
         info_log_dir: "/var".to_owned(),
         rate_bytes_per_sec: ReadableSize::kb(1),
+        rate_limiter_mode: DBRateLimiterMode::AllIo,
+        auto_tuned: true,
         bytes_per_sync: ReadableSize::mb(1),
         wal_bytes_per_sync: ReadableSize::kb(32),
         max_sub_compactions: 12,
         writable_file_max_buffer_size: ReadableSize::mb(12),
         use_direct_io_for_flush_and_compaction: true,
         enable_pipelined_write: false,
+        enable_unordered_write: true,
         defaultcf: DefaultCfConfig {
             block_size: ReadableSize::kb(12),
             block_cache_size: ReadableSize::gb(12),
@@ -222,6 +252,11 @@ fn test_serde_custom_tikv_config() {
             disable_auto_compactions: true,
             soft_pending_compaction_bytes_limit: ReadableSize::gb(12),
             hard_pending_compaction_bytes_limit: ReadableSize::gb(12),
+            force_consistency_checks: false,
+            titan: titan_cf_config.clone(),
+            prop_size_index_distance: 4000000,
+            prop_keys_index_distance: 40000,
+            enable_doubly_skiplist: false,
         },
         writecf: WriteCfConfig {
             block_size: ReadableSize::kb(12),
@@ -261,6 +296,21 @@ fn test_serde_custom_tikv_config() {
             disable_auto_compactions: true,
             soft_pending_compaction_bytes_limit: ReadableSize::gb(12),
             hard_pending_compaction_bytes_limit: ReadableSize::gb(12),
+            force_consistency_checks: false,
+            titan: TitanCfConfig {
+                min_blob_size: ReadableSize(1024), // default value
+                blob_file_compression: CompressionType::Lz4,
+                blob_cache_size: ReadableSize::mb(0),
+                min_gc_batch_size: ReadableSize::mb(16),
+                max_gc_batch_size: ReadableSize::mb(64),
+                discardable_ratio: 0.5,
+                sample_ratio: 0.1,
+                merge_small_file_threshold: ReadableSize::mb(8),
+                blob_run_mode: BlobRunMode::ReadOnly,
+            },
+            prop_size_index_distance: 4000000,
+            prop_keys_index_distance: 40000,
+            enable_doubly_skiplist: true,
         },
         lockcf: LockCfConfig {
             block_size: ReadableSize::kb(12),
@@ -300,6 +350,21 @@ fn test_serde_custom_tikv_config() {
             disable_auto_compactions: true,
             soft_pending_compaction_bytes_limit: ReadableSize::gb(12),
             hard_pending_compaction_bytes_limit: ReadableSize::gb(12),
+            force_consistency_checks: false,
+            titan: TitanCfConfig {
+                min_blob_size: ReadableSize(1024), // default value
+                blob_file_compression: CompressionType::Lz4,
+                blob_cache_size: ReadableSize::mb(0),
+                min_gc_batch_size: ReadableSize::mb(16),
+                max_gc_batch_size: ReadableSize::mb(64),
+                discardable_ratio: 0.5,
+                sample_ratio: 0.1,
+                merge_small_file_threshold: ReadableSize::mb(8),
+                blob_run_mode: BlobRunMode::ReadOnly, // default value
+            },
+            prop_size_index_distance: 4000000,
+            prop_keys_index_distance: 40000,
+            enable_doubly_skiplist: true,
         },
         raftcf: RaftCfConfig {
             block_size: ReadableSize::kb(12),
@@ -339,7 +404,23 @@ fn test_serde_custom_tikv_config() {
             disable_auto_compactions: true,
             soft_pending_compaction_bytes_limit: ReadableSize::gb(12),
             hard_pending_compaction_bytes_limit: ReadableSize::gb(12),
+            force_consistency_checks: false,
+            titan: TitanCfConfig {
+                min_blob_size: ReadableSize(1024), // default value
+                blob_file_compression: CompressionType::Lz4,
+                blob_cache_size: ReadableSize::mb(0),
+                min_gc_batch_size: ReadableSize::mb(16),
+                max_gc_batch_size: ReadableSize::mb(64),
+                discardable_ratio: 0.5,
+                sample_ratio: 0.1,
+                merge_small_file_threshold: ReadableSize::mb(8),
+                blob_run_mode: BlobRunMode::ReadOnly, // default value
+            },
+            prop_size_index_distance: 4000000,
+            prop_keys_index_distance: 40000,
+            enable_doubly_skiplist: true,
         },
+        titan: titan_db_config.clone(),
     };
     value.raftdb = RaftDbConfig {
         wal_recovery_mode: DBRecoveryMode::SkipAnyCorruptedRecords,
@@ -362,6 +443,7 @@ fn test_serde_custom_tikv_config() {
         writable_file_max_buffer_size: ReadableSize::mb(12),
         use_direct_io_for_flush_and_compaction: true,
         enable_pipelined_write: false,
+        enable_unordered_write: false,
         allow_concurrent_memtable_write: true,
         bytes_per_sync: ReadableSize::mb(1),
         wal_bytes_per_sync: ReadableSize::kb(32),
@@ -403,19 +485,32 @@ fn test_serde_custom_tikv_config() {
             disable_auto_compactions: true,
             soft_pending_compaction_bytes_limit: ReadableSize::gb(12),
             hard_pending_compaction_bytes_limit: ReadableSize::gb(12),
+            force_consistency_checks: false,
+            titan: titan_cf_config.clone(),
+            prop_size_index_distance: 4000000,
+            prop_keys_index_distance: 40000,
+            enable_doubly_skiplist: true,
         },
+        titan: titan_db_config.clone(),
     };
     value.storage = StorageConfig {
         data_dir: "/var".to_owned(),
         gc_ratio_threshold: 1.2,
         max_key_size: 8192,
-        scheduler_notify_capacity: 123,
         scheduler_concurrency: 123,
         scheduler_worker_pool_size: 1,
         scheduler_pending_write_threshold: ReadableSize::kb(123),
+        block_cache: BlockCacheConfig {
+            shared: true,
+            capacity: Some(ReadableSize::gb(40)),
+            num_shard_bits: 10,
+            strict_capacity_limit: true,
+            high_pri_pool_ratio: 0.8,
+            memory_allocator: Some(String::from("nodump")),
+        },
     };
     value.coprocessor = CopConfig {
-        split_region_on_table: true,
+        split_region_on_table: false,
         batch_split_limit: 1,
         region_max_size: ReadableSize::mb(12),
         region_split_size: ReadableSize::mb(12),
@@ -427,23 +522,25 @@ fn test_serde_custom_tikv_config() {
         cert_path: "invalid path".to_owned(),
         key_path: "invalid path".to_owned(),
         override_ssl_target: "".to_owned(),
+        cipher_file: "invalid path".to_owned(),
     };
     value.import = ImportConfig {
-        import_dir: "/abc".to_owned(),
         num_threads: 123,
-        num_import_jobs: 123,
-        num_import_sst_jobs: 123,
-        max_prepare_duration: ReadableDuration::minutes(12),
-        region_split_size: ReadableSize::mb(123),
         stream_channel_window: 123,
-        max_open_engines: 2,
+    };
+    value.panic_when_unexpected_key_or_data = true;
+    value.gc = GcConfig {
+        ratio_threshold: 1.2,
+        batch_keys: 256,
+        max_write_bytes_per_sec: ReadableSize::mb(10),
     };
 
-    let custom = read_file_in_project_dir("tests/integrations/config/test-custom.toml");
+    let custom = read_file_in_project_dir("integrations/config/test-custom.toml");
     let load = toml::from_str(&custom).unwrap();
     assert_eq!(value, load);
     let dump = toml::to_string_pretty(&load).unwrap();
-    assert_eq!(dump, custom);
+    let load_from_dump = toml::from_str(&dump).unwrap();
+    assert_eq!(load, load_from_dump);
 }
 
 #[test]
@@ -451,7 +548,7 @@ fn test_serde_default_config() {
     let cfg: TiKvConfig = toml::from_str("").unwrap();
     assert_eq!(cfg, TiKvConfig::default());
 
-    let content = read_file_in_project_dir("tests/integrations/config/test-default.toml");
+    let content = read_file_in_project_dir("integrations/config/test-default.toml");
     let cfg: TiKvConfig = toml::from_str(&content).unwrap();
     assert_eq!(cfg, TiKvConfig::default());
 }
@@ -466,4 +563,21 @@ fn test_readpool_default_config() {
     let mut expected = TiKvConfig::default();
     expected.readpool.storage.high_concurrency = 1;
     assert_eq!(cfg, expected);
+}
+
+#[test]
+fn test_block_cache_backward_compatible() {
+    let content = read_file_in_project_dir("integrations/config/test-cache-compatible.toml");
+    let mut cfg: TiKvConfig = toml::from_str(&content).unwrap();
+    assert!(cfg.storage.block_cache.shared);
+    assert!(cfg.storage.block_cache.capacity.is_none());
+    cfg.compatible_adjust();
+    assert!(cfg.storage.block_cache.capacity.is_some());
+    assert_eq!(
+        cfg.storage.block_cache.capacity.unwrap().0,
+        cfg.rocksdb.defaultcf.block_cache_size.0
+            + cfg.rocksdb.writecf.block_cache_size.0
+            + cfg.rocksdb.lockcf.block_cache_size.0
+            + cfg.raftdb.defaultcf.block_cache_size.0
+    );
 }

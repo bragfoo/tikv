@@ -1,15 +1,4 @@
-// Copyright 2016 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::sync::mpsc::channel;
 use std::sync::Arc;
@@ -17,18 +6,19 @@ use std::time::Duration;
 use std::{fs, thread};
 
 use kvproto::metapb;
+use kvproto::pdpb;
 use kvproto::raft_cmdpb::*;
 use kvproto::raft_serverpb::RaftMessage;
 use raft::eraftpb::MessageType;
 
+use engine::Iterable;
+use engine::CF_WRITE;
+use keys::data_key;
+use pd_client::PdClient;
 use test_raftstore::*;
-use tikv::pd::PdClient;
-use tikv::raftstore::store::engine::Iterable;
-use tikv::raftstore::store::keys::data_key;
 use tikv::raftstore::store::{Callback, WriteResponse};
 use tikv::raftstore::Result;
-use tikv::storage::CF_WRITE;
-use tikv::util::config::*;
+use tikv_util::config::*;
 
 pub const REGION_MAX_SIZE: u64 = 50000;
 pub const REGION_SPLIT_SIZE: u64 = 30000;
@@ -133,7 +123,7 @@ fn test_server_split_region_twice() {
         let mut resp = write_resp.response;
         let admin_resp = resp.mut_admin_response();
         let split_resp = admin_resp.mut_splits();
-        let mut regions = split_resp.take_regions().into_vec();
+        let mut regions: Vec<_> = split_resp.take_regions().into();
         let mut d = regions.drain(..);
         let (left, right) = (d.next().unwrap(), d.next().unwrap());
         assert_eq!(left.get_end_key(), key.as_slice());
@@ -175,7 +165,7 @@ fn test_auto_split_region<T: Simulator>(cluster: &mut Cluster<T>) {
     let last_key = put_till_size(cluster, REGION_SPLIT_SIZE, &mut range);
 
     // it should be finished in millis if split.
-    thread::sleep(Duration::from_secs(1));
+    thread::sleep(Duration::from_millis(300));
 
     let target = pd_client.get_region(&last_key).unwrap();
 
@@ -188,7 +178,11 @@ fn test_auto_split_region<T: Simulator>(cluster: &mut Cluster<T>) {
         &mut range,
     );
 
-    thread::sleep(Duration::from_secs(1));
+    let left = pd_client.get_region(b"").unwrap();
+    let right = pd_client.get_region(&max_key).unwrap();
+    if left == right {
+        cluster.wait_region_split(&region);
+    }
 
     let left = pd_client.get_region(b"").unwrap();
     let right = pd_client.get_region(&max_key).unwrap();
@@ -258,7 +252,7 @@ fn test_incompatible_server_auto_split_region() {
 #[derive(Clone)]
 struct EraseHeartbeatCommit;
 
-impl Filter<RaftMessage> for EraseHeartbeatCommit {
+impl Filter for EraseHeartbeatCommit {
     fn before(&self, msgs: &mut Vec<RaftMessage>) -> Result<()> {
         for msg in msgs {
             if msg.get_message().get_msg_type() == MessageType::MsgHeartbeat {
@@ -271,8 +265,20 @@ impl Filter<RaftMessage> for EraseHeartbeatCommit {
 
 fn check_cluster(cluster: &mut Cluster<impl Simulator>, k: &[u8], v: &[u8], all_committed: bool) {
     let region = cluster.pd_client.get_region(k).unwrap();
-    let leader = cluster.leader_of_region(region.get_id()).unwrap();
-    for i in 1..region.get_peers().len() as u64 + 1 {
+    let mut tried_cnt = 0;
+    let leader = loop {
+        match cluster.leader_of_region(region.get_id()) {
+            None => {
+                tried_cnt += 1;
+                if tried_cnt >= 3 {
+                    panic!("leader should be elected");
+                }
+                continue;
+            }
+            Some(l) => break l,
+        }
+    };
+    for i in 1..=region.get_peers().len() as u64 {
         let engine = cluster.get_engine(i);
         if all_committed || i == leader.get_store_id() {
             must_get_equal(&engine, k, v);
@@ -318,10 +324,9 @@ fn test_delay_split_region() {
     // the log.
     check_cluster(&mut cluster, b"k4", b"v4", false);
 
-    cluster.stop_node(1);
+    cluster.must_transfer_leader(region.get_id(), new_peer(3, 3));
     // New leader should flush old committed entries eagerly.
     check_cluster(&mut cluster, b"k4", b"v4", true);
-    cluster.run_node(1);
     cluster.must_put(b"k5", b"v5");
     // New committed entries should be broadcast lazily.
     check_cluster(&mut cluster, b"k5", b"v5", false);
@@ -467,6 +472,7 @@ fn test_server_apply_new_version_snapshot() {
 fn test_split_with_stale_peer<T: Simulator>(cluster: &mut Cluster<T>) {
     // disable raft log gc.
     cluster.cfg.raft_store.raft_log_gc_tick_interval = ReadableDuration::secs(60);
+    cluster.cfg.raft_store.peer_stale_state_check_interval = ReadableDuration::millis(500);
 
     let pd_client = Arc::clone(&cluster.pd_client);
     // Disable default max peer count check.
@@ -601,13 +607,13 @@ fn test_node_split_region_diff_check() {
     test_split_region_diff_check(&mut cluster);
 }
 
-fn test_split_stale_epoch<T: Simulator>(cluster: &mut Cluster<T>, right_derive: bool) {
+fn test_split_epoch_not_match<T: Simulator>(cluster: &mut Cluster<T>, right_derive: bool) {
     cluster.cfg.raft_store.right_derive_when_split = right_derive;
     cluster.run();
     let pd_client = Arc::clone(&cluster.pd_client);
     let old = pd_client.get_region(b"k1").unwrap();
     // Construct a get command using old region meta.
-    let get = new_request(
+    let get_old = new_request(
         old.get_id(),
         old.get_region_epoch().clone(),
         vec![new_get_cmd(b"k1")],
@@ -617,52 +623,70 @@ fn test_split_stale_epoch<T: Simulator>(cluster: &mut Cluster<T>, right_derive: 
     let left = pd_client.get_region(b"k1").unwrap();
     let right = pd_client.get_region(b"k3").unwrap();
 
-    let resp = cluster
-        .call_command_on_leader(get, Duration::from_secs(5))
-        .unwrap();
-    assert!(resp.get_header().has_error());
-    assert!(resp.get_header().get_error().has_stale_epoch());
-    if right_derive {
-        assert_eq!(
-            resp.get_header()
-                .get_error()
-                .get_stale_epoch()
-                .get_new_regions(),
-            &[right, left]
-        );
+    let new = if right_derive {
+        right.clone()
     } else {
-        assert_eq!(
-            resp.get_header()
-                .get_error()
-                .get_stale_epoch()
-                .get_new_regions(),
-            &[left, right]
+        left.clone()
+    };
+
+    // Newer epoch also triggers the EpochNotMatch error.
+    let mut latest_epoch = new.get_region_epoch().clone();
+    let latest_version = latest_epoch.get_version() + 1;
+    latest_epoch.set_version(latest_version);
+
+    let get_new = new_request(new.get_id(), latest_epoch, vec![new_get_cmd(b"k1")], false);
+    for get in &[get_old, get_new] {
+        let resp = cluster
+            .call_command_on_leader(get.clone(), Duration::from_secs(5))
+            .unwrap();
+        assert!(resp.get_header().has_error(), "{:?}", get);
+        assert!(
+            resp.get_header().get_error().has_epoch_not_match(),
+            "{:?}",
+            get
         );
+        if right_derive {
+            assert_eq!(
+                resp.get_header()
+                    .get_error()
+                    .get_epoch_not_match()
+                    .get_current_regions(),
+                &[right.clone(), left.clone()]
+            );
+        } else {
+            assert_eq!(
+                resp.get_header()
+                    .get_error()
+                    .get_epoch_not_match()
+                    .get_current_regions(),
+                &[left.clone(), right.clone()]
+            );
+        }
     }
 }
 
 #[test]
-fn test_server_split_stale_epoch_left_derive() {
+fn test_server_split_epoch_not_match_left_derive() {
     let mut cluster = new_server_cluster(0, 3);
-    test_split_stale_epoch(&mut cluster, false);
+    test_split_epoch_not_match(&mut cluster, false);
 }
 
 #[test]
-fn test_server_split_stale_epoch_right_derive() {
+fn test_server_split_epoch_not_match_right_derive() {
     let mut cluster = new_server_cluster(0, 3);
-    test_split_stale_epoch(&mut cluster, true);
+    test_split_epoch_not_match(&mut cluster, true);
 }
 
 #[test]
-fn test_node_split_stale_epoch_left_derive() {
+fn test_node_split_epoch_not_match_left_derive() {
     let mut cluster = new_node_cluster(0, 3);
-    test_split_stale_epoch(&mut cluster, false);
+    test_split_epoch_not_match(&mut cluster, false);
 }
 
 #[test]
-fn test_node_split_stale_epoch_right_derive() {
+fn test_node_split_epoch_not_match_right_derive() {
     let mut cluster = new_node_cluster(0, 3);
-    test_split_stale_epoch(&mut cluster, true);
+    test_split_epoch_not_match(&mut cluster, true);
 }
 
 // For the peer which is the leader of the region before split,
@@ -709,20 +733,20 @@ fn test_server_quick_election_after_split() {
 }
 
 #[test]
-fn test_node_half_split_region() {
+fn test_node_split_region() {
     let count = 5;
     let mut cluster = new_node_cluster(0, count);
-    test_half_split_region(&mut cluster);
+    test_split_region(&mut cluster);
 }
 
 #[test]
-fn test_server_half_split_region() {
+fn test_server_split_region() {
     let count = 5;
     let mut cluster = new_server_cluster(0, count);
-    test_half_split_region(&mut cluster);
+    test_split_region(&mut cluster);
 }
 
-fn test_half_split_region<T: Simulator>(cluster: &mut Cluster<T>) {
+fn test_split_region<T: Simulator>(cluster: &mut Cluster<T>) {
     // length of each key+value
     let item_len = 74;
     // make bucket's size to item_len, which means one row one bucket
@@ -735,9 +759,7 @@ fn test_half_split_region<T: Simulator>(cluster: &mut Cluster<T>) {
     let max_key = put_till_size(cluster, 9 * item_len, &mut range);
     let target = pd_client.get_region(&max_key).unwrap();
     assert_eq!(region, target);
-    pd_client.half_split_region(target);
-    // it should be finished in millis if split.
-    thread::sleep(Duration::from_secs(1));
+    pd_client.must_split_region(target, pdpb::CheckPolicy::Scan, vec![]);
 
     let left = pd_client.get_region(b"").unwrap();
     let right = pd_client.get_region(&max_key).unwrap();
@@ -745,6 +767,19 @@ fn test_half_split_region<T: Simulator>(cluster: &mut Cluster<T>) {
     assert_eq!(mid_key.as_slice(), right.get_start_key());
     assert_eq!(right.get_start_key(), left.get_end_key());
     assert_eq!(region.get_end_key(), right.get_end_key());
+
+    let region = pd_client.get_region(b"x").unwrap();
+    pd_client.must_split_region(
+        region,
+        pdpb::CheckPolicy::Usekey,
+        vec![b"x1".to_vec(), b"y2".to_vec()],
+    );
+    let x1 = pd_client.get_region(b"x1").unwrap();
+    assert_eq!(x1.get_start_key(), b"x1");
+    assert_eq!(x1.get_end_key(), b"y2");
+    let y2 = pd_client.get_region(b"y2").unwrap();
+    assert_eq!(y2.get_start_key(), b"y2");
+    assert_eq!(y2.get_end_key(), b"");
 }
 
 #[test]
@@ -802,7 +837,7 @@ fn test_node_split_update_region_right_derive() {
 }
 
 #[test]
-fn test_split_with_stale_epoch() {
+fn test_split_with_epoch_not_match() {
     let mut cluster = new_node_cluster(0, 3);
     cluster.run();
     cluster.must_transfer_leader(1, new_peer(1, 1));
@@ -813,11 +848,11 @@ fn test_split_with_stale_epoch() {
     pd_client.must_remove_peer(1, new_peer(2, 2));
     let region = cluster.get_region(b"");
 
-    let mut admin_req = AdminRequest::new();
+    let mut admin_req = AdminRequest::default();
     admin_req.set_cmd_type(AdminCmdType::BatchSplit);
 
-    let mut batch_split_req = BatchSplitRequest::new();
-    batch_split_req.mut_requests().push(SplitRequest::new());
+    let mut batch_split_req = BatchSplitRequest::default();
+    batch_split_req.mut_requests().push(SplitRequest::default());
     batch_split_req.mut_requests()[0].set_split_key(b"s".to_vec());
     batch_split_req.mut_requests()[0].set_new_region_id(1000);
     batch_split_req.mut_requests()[0].set_new_peer_ids(vec![1001, 1002]);
@@ -830,5 +865,5 @@ fn test_split_with_stale_epoch() {
     let resp = cluster
         .call_command_on_leader(req, Duration::from_secs(3))
         .unwrap();
-    assert!(resp.get_header().get_error().has_stale_epoch());
+    assert!(resp.get_header().get_error().has_epoch_not_match());
 }

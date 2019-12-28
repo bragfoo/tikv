@@ -1,27 +1,18 @@
-// Copyright 2018 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
 //! A simple panic hook that allows skipping printing stack trace conditionally.
-
-#![feature(box_syntax)]
+//!
+//! This crate is only for use during testing - in production, any panic in TiKV
+//! is fatal, and it is compiled with panic=abort, so use of this crate in
+//! production is an error.
 
 use std::cell::RefCell;
 use std::panic::{self, AssertUnwindSafe, PanicInfo};
-use std::sync::{Once, ONCE_INIT};
+use std::sync::Once;
 
-static INIT: Once = ONCE_INIT;
+static INIT: Once = Once::new();
 // store the default panic hook defined in std.
-static mut DEFAULT_HOOK: Option<*mut (Fn(&PanicInfo) + 'static + Sync + Send)> = None;
+static mut DEFAULT_HOOK: Option<*mut (dyn Fn(&PanicInfo<'_>) + 'static + Sync + Send)> = None;
 
 thread_local! {
     static MUTED: RefCell<bool> = RefCell::new(false)
@@ -31,7 +22,7 @@ thread_local! {
 fn initialize() {
     unsafe {
         DEFAULT_HOOK = Some(Box::into_raw(panic::take_hook()));
-        panic::set_hook(box track_hook);
+        panic::set_hook(Box::new(track_hook));
     }
 }
 
@@ -47,7 +38,7 @@ pub fn unmute() {
 }
 
 /// Print the stacktrace according to the static MUTED.
-fn track_hook(p: &PanicInfo) {
+fn track_hook(p: &PanicInfo<'_>) {
     MUTED.with(|m| {
         if *m.borrow() {
             return;
@@ -65,7 +56,7 @@ fn track_hook(p: &PanicInfo) {
 /// This function assumes the closure is able to be forced to implement `UnwindSafe`.
 ///
 /// Also see [`AssertUnwindSafe`](https://doc.rust-lang.org/std/panic/struct.AssertUnwindSafe.html).
-pub fn recover_safe<F, R>(f: F) -> ::std::thread::Result<R>
+pub fn recover_safe<F, R>(f: F) -> std::thread::Result<R>
 where
     F: FnOnce() -> R,
 {

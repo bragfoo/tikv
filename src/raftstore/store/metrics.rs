@@ -1,15 +1,4 @@
-// Copyright 2016 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
 use prometheus::*;
 
@@ -32,6 +21,13 @@ lazy_static! {
         register_histogram!(
             "tikv_raftstore_append_log_duration_seconds",
             "Bucketed histogram of peer appending log duration",
+            exponential_buckets(0.0005, 2.0, 20).unwrap()
+        ).unwrap();
+
+    pub static ref PEER_COMMIT_LOG_HISTOGRAM: Histogram =
+        register_histogram!(
+            "tikv_raftstore_commit_log_duration_seconds",
+            "Bucketed histogram of peer commits logs duration",
             exponential_buckets(0.0005, 2.0, 20).unwrap()
         ).unwrap();
 
@@ -67,13 +63,6 @@ lazy_static! {
         register_int_counter_vec!(
             "tikv_raftstore_raft_dropped_message_total",
             "Total number of raft dropped messages.",
-            &["type"]
-        ).unwrap();
-
-    pub static ref STORE_PD_HEARTBEAT_GAUGE_VEC: IntGaugeVec =
-        register_int_gauge_vec!(
-            "tikv_pd_heartbeat_tick_total",
-            "Total number of pd heartbeat ticks.",
             &["type"]
         ).unwrap();
 
@@ -184,14 +173,14 @@ lazy_static! {
         register_histogram!(
             "tikv_snapshot_kv_count",
             "Total number of kv in snapshot",
-             exponential_buckets(100.0, 2.0, 20).unwrap() //100,100*2^1,...100M
+            exponential_buckets(100.0, 2.0, 20).unwrap() //100,100*2^1,...100M
         ).unwrap();
 
     pub static ref SNAPSHOT_SIZE_HISTOGRAM: Histogram =
         register_histogram!(
             "tikv_snapshot_size",
             "Size of snapshot",
-             exponential_buckets(1024.0, 2.0, 22).unwrap() // 1024,1024*2^1,..,4G
+            exponential_buckets(1024.0, 2.0, 22).unwrap() // 1024,1024*2^1,..,4G
         ).unwrap();
 
     pub static ref RAFT_ENTRY_FETCHES: IntCounterVec =
@@ -227,5 +216,18 @@ lazy_static! {
             "Duration of raft store events.",
             &["type"],
             exponential_buckets(0.001, 1.59, 20).unwrap() // max 10s
+        ).unwrap();
+
+    pub static ref RAFT_READ_INDEX_PENDING_DURATION: Histogram =
+        register_histogram!(
+            "tikv_raftstore_read_index_pending_duration",
+            "Duration of pending read index",
+            exponential_buckets(0.001, 2.0, 20).unwrap() // max 1000s
+        ).unwrap();
+
+    pub static ref RAFT_READ_INDEX_PENDING_COUNT: IntGauge =
+        register_int_gauge!(
+            "tikv_raftstore_read_index_pending",
+            "pending read index count"
         ).unwrap();
 }

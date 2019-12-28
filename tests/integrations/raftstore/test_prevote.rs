@@ -1,22 +1,11 @@
-// Copyright 2016 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::sync::{atomic::AtomicBool, mpsc, Arc};
 use std::thread;
 use std::time::Duration;
 
 use raft::eraftpb::MessageType;
-use tikv::util::HandyRwLock;
+use tikv_util::HandyRwLock;
 
 use test_raftstore::*;
 
@@ -48,12 +37,15 @@ fn attach_prevote_notifiers<T: Simulator>(cluster: &Cluster<T>, peer: u64) -> mp
 // Validate that prevote is used in elections after partition or reboot of some nodes.
 fn test_prevote<T: Simulator>(
     cluster: &mut Cluster<T>,
-    failure_type: FailureType,
+    failure_type: FailureType<'_>,
     leader_after_failure_id: impl Into<Option<u64>>,
     detect_during_failure: impl Into<Option<(u64, bool)>>,
     detect_during_recovery: impl Into<Option<(u64, bool)>>,
 ) {
     cluster.cfg.raft_store.prevote = true;
+    // To stable the test, we use a large election timeout to make
+    // leader's readiness get handle within an election timeout
+    configure_for_lease_read(cluster, Some(20), Some(10));
 
     let leader_id = 1;
     let detect_during_failure = detect_during_failure.into();
@@ -101,7 +93,9 @@ fn test_prevote<T: Simulator>(
         }
         FailureType::Reboot(peers) => {
             cluster.clear_send_filters();
-            peers.iter().for_each(|&peer| cluster.run_node(peer));
+            peers.iter().for_each(|&peer| {
+                cluster.run_node(peer).unwrap();
+            });
         }
     };
 
@@ -136,7 +130,7 @@ fn test_prevote<T: Simulator>(
 
 #[test]
 fn test_prevote_partition_leader_in_majority_detect_in_majority() {
-    let mut cluster = new_server_cluster(0, 5);
+    let mut cluster = new_node_cluster(0, 5);
     // Since the leader is in the majority and not rebooted, it sees no prevote.
     test_prevote(
         &mut cluster,
@@ -150,7 +144,7 @@ fn test_prevote_partition_leader_in_majority_detect_in_majority() {
 // TODO: Enable detect after failure when we can reliably capture the prevote.
 #[test]
 fn test_prevote_partition_leader_in_majority_detect_in_minority() {
-    let mut cluster = new_server_cluster(0, 5);
+    let mut cluster = new_node_cluster(0, 5);
     // The follower is in the minority and is part of a prevote process. On rejoin it adopts the
     // old leader.
     test_prevote(
@@ -165,7 +159,7 @@ fn test_prevote_partition_leader_in_majority_detect_in_minority() {
 // TODO: Enable detect after failure when we can reliably capture the prevote.
 #[test]
 fn test_prevote_partition_leader_in_minority_detect_in_majority() {
-    let mut cluster = new_server_cluster(0, 5);
+    let mut cluster = new_node_cluster(0, 5);
     // The follower is in the minority and is part of a prevote process. On rejoin it adopts the
     // old leader.
     test_prevote(
@@ -180,7 +174,7 @@ fn test_prevote_partition_leader_in_minority_detect_in_majority() {
 // TODO: Enable detect after failure when we can reliably capture the prevote.
 #[test]
 fn test_prevote_partition_leader_in_minority_detect_in_minority() {
-    let mut cluster = new_server_cluster(0, 5);
+    let mut cluster = new_node_cluster(0, 5);
     // The follower is in the minority and is part of a prevote process. On rejoin it adopts the
     // old leader.
     test_prevote(
@@ -194,7 +188,7 @@ fn test_prevote_partition_leader_in_minority_detect_in_minority() {
 
 #[test]
 fn test_prevote_reboot_majority_followers() {
-    let mut cluster = new_server_cluster(0, 5);
+    let mut cluster = new_node_cluster(0, 5);
     // A prevote round will start, but nothing will succeed.
     test_prevote(
         &mut cluster,
@@ -207,7 +201,7 @@ fn test_prevote_reboot_majority_followers() {
 
 #[test]
 fn test_prevote_reboot_minority_followers() {
-    let mut cluster = new_server_cluster(0, 5);
+    let mut cluster = new_node_cluster(0, 5);
     // A prevote round will start, but nothing will succeed until recovery.
     test_prevote(
         &mut cluster,
@@ -219,13 +213,14 @@ fn test_prevote_reboot_minority_followers() {
 }
 
 // Test isolating a minority of the cluster and make sure that the remove themselves.
+#[cfg(feature = "protobuf-codec")]
 fn test_pair_isolated<T: Simulator>(cluster: &mut Cluster<T>) {
     let region = 1;
     let pd_client = Arc::clone(&cluster.pd_client);
 
     // Given some nodes A, B, C, D, E, we partition the cluster such that D, E are isolated from the rest.
     cluster.run();
-    // Choose a predictable leader so we don't accidently partition the leader.
+    // Choose a predictable leader so we don't accidentally partition the leader.
     cluster.must_transfer_leader(region, new_peer(1, 1));
     cluster.partition(vec![1, 2, 3], vec![4, 5]);
 
@@ -238,6 +233,8 @@ fn test_pair_isolated<T: Simulator>(cluster: &mut Cluster<T>) {
     cluster.must_remove_region(5, region);
 }
 
+// FIXME(nrc) failing on CI only
+#[cfg(feature = "protobuf-codec")]
 #[test]
 fn test_server_pair_isolated() {
     let mut cluster = new_server_cluster(0, 5);

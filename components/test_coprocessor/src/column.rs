@@ -1,20 +1,10 @@
-// Copyright 2018 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
 use super::*;
 
-use tikv::coprocessor::codec::{datum, Datum};
-use tipb::schema::ColumnInfo;
+use tidb_query::codec::{datum, Datum};
+use tidb_query::expr::EvalContext;
+use tipb::ColumnInfo;
 
 pub const TYPE_VAR_CHAR: i32 = 1;
 pub const TYPE_LONG: i32 = 2;
@@ -22,20 +12,22 @@ pub const TYPE_LONG: i32 = 2;
 #[derive(Clone)]
 pub struct Column {
     pub id: i64,
-    pub col_type: i32,
+    pub(crate) col_type: i32,
     // negative means not a index key, 0 means primary key, positive means normal index key.
     pub index: i64,
-    pub default_val: Option<Datum>,
+    pub(crate) default_val: Option<Datum>,
 }
 
 impl Column {
-    pub fn get_column_info(&self) -> ColumnInfo {
-        let mut c_info = ColumnInfo::new();
+    pub fn as_column_info(&self) -> ColumnInfo {
+        let mut c_info = ColumnInfo::default();
         c_info.set_column_id(self.id);
         c_info.set_tp(self.col_type);
         c_info.set_pk_handle(self.index == 0);
         if let Some(ref dv) = self.default_val {
-            c_info.set_default_val(datum::encode_value(&[dv.clone()]).unwrap())
+            c_info.set_default_val(
+                datum::encode_value(&mut EvalContext::default(), &[dv.clone()]).unwrap(),
+            )
         }
         c_info
     }

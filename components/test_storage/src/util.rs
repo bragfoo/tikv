@@ -1,20 +1,9 @@
-// Copyright 2017 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
 use kvproto::kvrpcpb::Context;
 
 use test_raftstore::{new_server_cluster, Cluster, ServerCluster, SimulateEngine};
-use tikv::util::HandyRwLock;
+use tikv_util::HandyRwLock;
 
 use super::*;
 
@@ -29,7 +18,7 @@ pub fn new_raft_engine(
     let region = cluster.get_region(key.as_bytes());
     let leader = cluster.leader_of_region(region.get_id()).unwrap();
     let engine = cluster.sim.rl().storages[&leader.get_id()].clone();
-    let mut ctx = Context::new();
+    let mut ctx = Context::default();
     ctx.set_region_id(region.get_id());
     ctx.set_region_epoch(region.get_region_epoch().clone());
     ctx.set_peer(leader.clone());

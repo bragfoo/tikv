@@ -1,37 +1,27 @@
-// Copyright 2016 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::error;
 use std::io::Error as IoError;
 use std::net::AddrParseError;
 use std::result;
 
-use futures::Canceled;
-use grpc::Error as GrpcError;
+use grpcio::Error as GrpcError;
+use hyper::Error as HttpError;
 use protobuf::ProtobufError;
+use tokio_sync::oneshot::error::RecvError;
 
 use super::snap::Task as SnapTask;
-use pd::Error as PdError;
-use raftstore::Error as RaftServerError;
-use storage::engine::Error as EngineError;
-use storage::Error as StorageError;
-use util::codec::Error as CodecError;
-use util::worker::ScheduleError;
+use crate::raftstore::Error as RaftServerError;
+use crate::storage::kv::Error as EngineError;
+use crate::storage::Error as StorageError;
+use pd_client::Error as PdError;
+use tikv_util::codec::Error as CodecError;
+use tikv_util::worker::ScheduleError;
 
-quick_error!{
+quick_error! {
     #[derive(Debug)]
     pub enum Error {
-        Other(err: Box<error::Error + Sync + Send>) {
+        Other(err: Box<dyn error::Error + Sync + Send>) {
             from()
             cause(err.as_ref())
             description(err.description())
@@ -85,6 +75,12 @@ quick_error!{
             display("{:?}", err)
             description(err.description())
         }
+        RealEngine(err: engine::Error) {
+            from()
+            cause(err)
+            display("{:?}", err)
+            description(err.description())
+        }
         Pd(err: PdError) {
             from()
             cause(err)
@@ -98,7 +94,13 @@ quick_error!{
         Sink {
             description("failed to poll from mpsc receiver")
         }
-        Canceled(err: Canceled) {
+        RecvError(err: RecvError) {
+            from()
+            cause(err)
+            display("{:?}", err)
+            description(err.description())
+        }
+        Http(err: HttpError) {
             from()
             cause(err)
             display("{:?}", err)

@@ -1,15 +1,4 @@
-// Copyright 2017 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::result;
 
@@ -50,7 +39,7 @@ pub trait PdMocker {
         None
     }
 
-    fn alloc_id(&self, _: &AllocIDRequest) -> Option<Result<AllocIDResponse>> {
+    fn alloc_id(&self, _: &AllocIdRequest) -> Option<Result<AllocIdResponse>> {
         None
     }
 
@@ -81,7 +70,7 @@ pub trait PdMocker {
         None
     }
 
-    fn get_region_by_id(&self, _: &GetRegionByIDRequest) -> Option<Result<GetRegionResponse>> {
+    fn get_region_by_id(&self, _: &GetRegionByIdRequest) -> Option<Result<GetRegionResponse>> {
         None
     }
 
@@ -119,4 +108,18 @@ pub trait PdMocker {
     }
 
     fn set_endpoints(&self, _: Vec<String>) {}
+
+    fn update_gc_safe_point(
+        &self,
+        _: &UpdateGcSafePointRequest,
+    ) -> Option<Result<UpdateGcSafePointResponse>> {
+        None
+    }
+
+    fn get_gc_safe_point(
+        &self,
+        _: &GetGcSafePointRequest,
+    ) -> Option<Result<GetGcSafePointResponse>> {
+        None
+    }
 }

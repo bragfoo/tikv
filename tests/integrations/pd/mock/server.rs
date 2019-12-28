@@ -1,30 +1,18 @@
-// Copyright 2017 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use futures::{Future, Sink, Stream};
-use grpc::{
+use grpcio::{
     DuplexSink, EnvBuilder, RequestStream, RpcContext, RpcStatus, RpcStatusCode,
     Server as GrpcServer, ServerBuilder, UnarySink, WriteFlags,
 };
-use tikv::pd::Error as PdError;
-use tikv::util::security::*;
+use pd_client::Error as PdError;
+use tikv_util::security::*;
 
 use kvproto::pdpb::*;
-use kvproto::pdpb_grpc::{self, Pd};
 
 use super::mocker::*;
 
@@ -39,6 +27,10 @@ impl Server<Service> {
         let eps = vec![("127.0.0.1".to_owned(), 0); eps_count];
         let case = Option::None::<Arc<Service>>;
         Self::with_configuration(&mgr, eps, case)
+    }
+
+    pub fn default_handler(&self) -> &Service {
+        &self.mocker.default_handler
     }
 }
 
@@ -69,7 +61,7 @@ impl<C: PdMocker + Send + Sync + 'static> Server<C> {
     }
 
     pub fn start(&mut self, mgr: &SecurityManager, eps: Vec<(String, u16)>) {
-        let service = pdpb_grpc::create_pd(self.mocker.clone());
+        let service = create_pd(self.mocker.clone());
         let env = Arc::new(
             EnvBuilder::new()
                 .cq_count(1)
@@ -109,10 +101,14 @@ impl<C: PdMocker + Send + Sync + 'static> Server<C> {
     }
 }
 
-fn hijack_unary<F, R, C: PdMocker>(mock: &mut PdMock<C>, ctx: RpcContext, sink: UnarySink<R>, f: F)
-where
+fn hijack_unary<F, R, C: PdMocker>(
+    mock: &mut PdMock<C>,
+    ctx: RpcContext<'_>,
+    sink: UnarySink<R>,
+    f: F,
+) where
     R: Send + 'static,
-    F: Fn(&PdMocker) -> Option<Result<R>>,
+    F: Fn(&dyn PdMocker) -> Option<Result<R>>,
 {
     let resp = mock
         .case
@@ -126,7 +122,7 @@ where
                 .map_err(move |err| error!("failed to reply: {:?}", err)),
         ),
         Some(Err(err)) => {
-            let status = RpcStatus::new(RpcStatusCode::Unknown, Some(format!("{:?}", err)));
+            let status = RpcStatus::new(RpcStatusCode::UNKNOWN, Some(format!("{:?}", err)));
             ctx.spawn(
                 sink.fail(status)
                     .map_err(move |err| error!("failed to reply: {:?}", err)),
@@ -134,7 +130,7 @@ where
         }
         _ => {
             let status = RpcStatus::new(
-                RpcStatusCode::Unimplemented,
+                RpcStatusCode::UNIMPLEMENTED,
                 Some("Unimplemented".to_owned()),
             );
             ctx.spawn(
@@ -163,20 +159,20 @@ impl<C: PdMocker> Clone for PdMock<C> {
 impl<C: PdMocker + Send + Sync + 'static> Pd for PdMock<C> {
     fn get_members(
         &mut self,
-        ctx: RpcContext,
+        ctx: RpcContext<'_>,
         req: GetMembersRequest,
         sink: UnarySink<GetMembersResponse>,
     ) {
         hijack_unary(self, ctx, sink, |c| c.get_members(&req))
     }
 
-    fn tso(&mut self, _: RpcContext, _: RequestStream<TsoRequest>, _: DuplexSink<TsoResponse>) {
+    fn tso(&mut self, _: RpcContext<'_>, _: RequestStream<TsoRequest>, _: DuplexSink<TsoResponse>) {
         unimplemented!()
     }
 
     fn bootstrap(
         &mut self,
-        ctx: RpcContext,
+        ctx: RpcContext<'_>,
         req: BootstrapRequest,
         sink: UnarySink<BootstrapResponse>,
     ) {
@@ -185,20 +181,25 @@ impl<C: PdMocker + Send + Sync + 'static> Pd for PdMock<C> {
 
     fn is_bootstrapped(
         &mut self,
-        ctx: RpcContext,
+        ctx: RpcContext<'_>,
         req: IsBootstrappedRequest,
         sink: UnarySink<IsBootstrappedResponse>,
     ) {
         hijack_unary(self, ctx, sink, |c| c.is_bootstrapped(&req))
     }
 
-    fn alloc_id(&mut self, ctx: RpcContext, req: AllocIDRequest, sink: UnarySink<AllocIDResponse>) {
+    fn alloc_id(
+        &mut self,
+        ctx: RpcContext<'_>,
+        req: AllocIdRequest,
+        sink: UnarySink<AllocIdResponse>,
+    ) {
         hijack_unary(self, ctx, sink, |c| c.alloc_id(&req))
     }
 
     fn get_store(
         &mut self,
-        ctx: RpcContext,
+        ctx: RpcContext<'_>,
         req: GetStoreRequest,
         sink: UnarySink<GetStoreResponse>,
     ) {
@@ -207,7 +208,7 @@ impl<C: PdMocker + Send + Sync + 'static> Pd for PdMock<C> {
 
     fn put_store(
         &mut self,
-        ctx: RpcContext,
+        ctx: RpcContext<'_>,
         req: PutStoreRequest,
         sink: UnarySink<PutStoreResponse>,
     ) {
@@ -216,7 +217,7 @@ impl<C: PdMocker + Send + Sync + 'static> Pd for PdMock<C> {
 
     fn get_all_stores(
         &mut self,
-        ctx: RpcContext,
+        ctx: RpcContext<'_>,
         req: GetAllStoresRequest,
         sink: UnarySink<GetAllStoresResponse>,
     ) {
@@ -225,7 +226,7 @@ impl<C: PdMocker + Send + Sync + 'static> Pd for PdMock<C> {
 
     fn store_heartbeat(
         &mut self,
-        ctx: RpcContext,
+        ctx: RpcContext<'_>,
         req: StoreHeartbeatRequest,
         sink: UnarySink<StoreHeartbeatResponse>,
     ) {
@@ -234,7 +235,7 @@ impl<C: PdMocker + Send + Sync + 'static> Pd for PdMock<C> {
 
     fn region_heartbeat(
         &mut self,
-        ctx: RpcContext,
+        ctx: RpcContext<'_>,
         stream: RequestStream<RegionHeartbeatRequest>,
         sink: DuplexSink<RegionHeartbeatResponse>,
     ) {
@@ -265,7 +266,7 @@ impl<C: PdMocker + Send + Sync + 'static> Pd for PdMock<C> {
 
     fn get_region(
         &mut self,
-        ctx: RpcContext,
+        ctx: RpcContext<'_>,
         req: GetRegionRequest,
         sink: UnarySink<GetRegionResponse>,
     ) {
@@ -274,20 +275,20 @@ impl<C: PdMocker + Send + Sync + 'static> Pd for PdMock<C> {
 
     fn get_region_by_id(
         &mut self,
-        ctx: RpcContext,
-        req: GetRegionByIDRequest,
+        ctx: RpcContext<'_>,
+        req: GetRegionByIdRequest,
         sink: UnarySink<GetRegionResponse>,
     ) {
         hijack_unary(self, ctx, sink, |c| c.get_region_by_id(&req))
     }
 
-    fn ask_split(&mut self, _: RpcContext, _: AskSplitRequest, _: UnarySink<AskSplitResponse>) {
+    fn ask_split(&mut self, _: RpcContext<'_>, _: AskSplitRequest, _: UnarySink<AskSplitResponse>) {
         unimplemented!()
     }
 
     fn report_split(
         &mut self,
-        _: RpcContext,
+        _: RpcContext<'_>,
         _: ReportSplitRequest,
         _: UnarySink<ReportSplitResponse>,
     ) {
@@ -296,7 +297,7 @@ impl<C: PdMocker + Send + Sync + 'static> Pd for PdMock<C> {
 
     fn ask_batch_split(
         &mut self,
-        ctx: RpcContext,
+        ctx: RpcContext<'_>,
         req: AskBatchSplitRequest,
         sink: UnarySink<AskBatchSplitResponse>,
     ) {
@@ -305,7 +306,7 @@ impl<C: PdMocker + Send + Sync + 'static> Pd for PdMock<C> {
 
     fn report_batch_split(
         &mut self,
-        ctx: RpcContext,
+        ctx: RpcContext<'_>,
         req: ReportBatchSplitRequest,
         sink: UnarySink<ReportBatchSplitResponse>,
     ) {
@@ -314,7 +315,7 @@ impl<C: PdMocker + Send + Sync + 'static> Pd for PdMock<C> {
 
     fn get_cluster_config(
         &mut self,
-        ctx: RpcContext,
+        ctx: RpcContext<'_>,
         req: GetClusterConfigRequest,
         sink: UnarySink<GetClusterConfigResponse>,
     ) {
@@ -323,7 +324,7 @@ impl<C: PdMocker + Send + Sync + 'static> Pd for PdMock<C> {
 
     fn put_cluster_config(
         &mut self,
-        ctx: RpcContext,
+        ctx: RpcContext<'_>,
         req: PutClusterConfigRequest,
         sink: UnarySink<PutClusterConfigResponse>,
     ) {
@@ -332,7 +333,7 @@ impl<C: PdMocker + Send + Sync + 'static> Pd for PdMock<C> {
 
     fn scatter_region(
         &mut self,
-        ctx: RpcContext,
+        ctx: RpcContext<'_>,
         req: ScatterRegionRequest,
         sink: UnarySink<ScatterRegionResponse>,
     ) {
@@ -341,7 +342,7 @@ impl<C: PdMocker + Send + Sync + 'static> Pd for PdMock<C> {
 
     fn get_prev_region(
         &mut self,
-        _: RpcContext,
+        _: RpcContext<'_>,
         _: GetRegionRequest,
         _: UnarySink<GetRegionResponse>,
     ) {
@@ -350,27 +351,45 @@ impl<C: PdMocker + Send + Sync + 'static> Pd for PdMock<C> {
 
     fn get_gc_safe_point(
         &mut self,
-        _ctx: RpcContext,
-        _req: GetGCSafePointRequest,
-        _sink: UnarySink<GetGCSafePointResponse>,
+        ctx: RpcContext<'_>,
+        req: GetGcSafePointRequest,
+        sink: UnarySink<GetGcSafePointResponse>,
     ) {
-        unimplemented!()
+        hijack_unary(self, ctx, sink, |c| c.get_gc_safe_point(&req))
     }
 
     fn update_gc_safe_point(
         &mut self,
-        _ctx: RpcContext,
-        _req: UpdateGCSafePointRequest,
-        _sink: UnarySink<UpdateGCSafePointResponse>,
+        ctx: RpcContext<'_>,
+        req: UpdateGcSafePointRequest,
+        sink: UnarySink<UpdateGcSafePointResponse>,
     ) {
-        unimplemented!()
+        hijack_unary(self, ctx, sink, |c| c.update_gc_safe_point(&req))
     }
 
     fn sync_regions(
         &mut self,
-        _ctx: RpcContext,
+        _ctx: RpcContext<'_>,
         _stream: RequestStream<SyncRegionRequest>,
         _sink: DuplexSink<SyncRegionResponse>,
+    ) {
+        unimplemented!()
+    }
+
+    fn get_operator(
+        &mut self,
+        _ctx: RpcContext<'_>,
+        _stream: GetOperatorRequest,
+        _sink: UnarySink<GetOperatorResponse>,
+    ) {
+        unimplemented!()
+    }
+
+    fn scan_regions(
+        &mut self,
+        _ctx: RpcContext<'_>,
+        _req: ScanRegionsRequest,
+        _sink: UnarySink<ScanRegionsResponse>,
     ) {
         unimplemented!()
     }

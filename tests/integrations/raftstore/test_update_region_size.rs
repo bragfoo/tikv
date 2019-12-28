@@ -1,22 +1,11 @@
-// Copyright 2016 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::sync::Arc;
 use std::{thread, time};
 
+use pd_client::PdClient;
 use test_raftstore::*;
-use tikv::pd::PdClient;
-use tikv::util::config::*;
+use tikv_util::config::*;
 
 fn flush<T: Simulator>(cluster: &mut Cluster<T>) {
     for engines in cluster.engines.values() {
@@ -24,7 +13,7 @@ fn flush<T: Simulator>(cluster: &mut Cluster<T>) {
     }
 }
 
-fn test_update_regoin_size<T: Simulator>(cluster: &mut Cluster<T>) {
+fn test_update_region_size<T: Simulator>(cluster: &mut Cluster<T>) {
     cluster.cfg.raft_store.pd_heartbeat_tick_interval = ReadableDuration::millis(50);
     cluster.cfg.raft_store.split_region_check_tick_interval = ReadableDuration::millis(50);
     cluster.cfg.raft_store.region_split_check_diff = ReadableSize::kb(1);
@@ -33,7 +22,7 @@ fn test_update_regoin_size<T: Simulator>(cluster: &mut Cluster<T>) {
         .rocksdb
         .defaultcf
         .level0_file_num_compaction_trigger = 10;
-    cluster.start();
+    cluster.start().unwrap();
 
     for _ in 0..2 {
         for i in 0..1000 {
@@ -81,5 +70,5 @@ fn test_update_regoin_size<T: Simulator>(cluster: &mut Cluster<T>) {
 fn test_server_update_region_size() {
     let count = 1;
     let mut cluster = new_server_cluster(0, count);
-    test_update_regoin_size(&mut cluster);
+    test_update_region_size(&mut cluster);
 }

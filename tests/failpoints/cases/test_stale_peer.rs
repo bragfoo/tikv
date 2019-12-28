@@ -1,25 +1,14 @@
-// Copyright 2018 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::thread;
 
 use fail;
 use test_raftstore::*;
-use tikv::util::config::ReadableDuration;
+use tikv_util::config::ReadableDuration;
 
 #[test]
 fn test_one_node_leader_missing() {
-    let _guard = ::setup();
+    let _guard = crate::setup();
 
     let mut cluster = new_server_cluster(0, 1);
 
@@ -40,7 +29,7 @@ fn test_one_node_leader_missing() {
     let check_stale_state = "peer_check_stale_state";
     fail::cfg(check_stale_state, "panic").unwrap();
 
-    cluster.start();
+    cluster.start().unwrap();
 
     // Check stale state 3 times,
     thread::sleep(cluster.cfg.raft_store.peer_stale_state_check_interval.0 * 3);
@@ -49,7 +38,7 @@ fn test_one_node_leader_missing() {
 
 #[test]
 fn test_node_update_localreader_after_removed() {
-    let _guard = ::setup();
+    let _guard = crate::setup();
 
     let mut cluster = new_node_cluster(0, 6);
     let pd_client = cluster.pd_client.clone();

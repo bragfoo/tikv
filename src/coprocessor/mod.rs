@@ -1,103 +1,80 @@
-// Copyright 2016 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
+//! Handles simple SQL query executors locally.
+//!
+//! Most TiDB read queries are processed by Coprocessor instead of KV interface.
+//! By doing so, the CPU of TiKV nodes can be utilized for computing and the
+//! amount of data to transfer can be reduced (i.e. filtered at TiKV side).
+//!
+//! Notice that Coprocessor handles more than simple SQL query executors (DAG request). It also
+//! handles analyzing requests and checksum requests.
+//!
+//! The entry point of handling all coprocessor requests is `Endpoint`. Common steps are:
+//! 1. Parse the request into a DAG request, Checksum request or Analyze request.
+//! 2. Retrieve a snapshot from the underlying engine according to the given timestamp.
+//! 3. Build corresponding request handlers from the snapshot and request detail.
+//! 4. Run request handlers once (for unary requests) or multiple times (for streaming requests)
+//!    on a future thread pool.
+//! 5. Return handling result as a response.
+//!
+//! Please refer to `Endpoint` for more details.
+
+mod cache;
 mod checksum;
-pub mod codec;
 pub mod dag;
 mod endpoint;
 mod error;
 pub mod local_metrics;
 mod metrics;
-mod readpool_context;
+pub mod readpool_impl;
 mod statistics;
 mod tracker;
-pub mod util;
 
 pub use self::endpoint::Endpoint;
 pub use self::error::{Error, Result};
-pub use self::readpool_context::Context as ReadPoolContext;
+pub use checksum::checksum_crc64_xor;
 
-use std::boxed::FnBox;
-
+use crate::storage::Statistics;
+use async_trait::async_trait;
 use kvproto::{coprocessor as coppb, kvrpcpb};
-
-use util::time::{Duration, Instant};
+use tikv_util::deadline::Deadline;
+use tikv_util::time::Duration;
+use txn_types::TsSet;
 
 pub const REQ_TYPE_DAG: i64 = 103;
 pub const REQ_TYPE_ANALYZE: i64 = 104;
 pub const REQ_TYPE_CHECKSUM: i64 = 105;
 
-const SINGLE_GROUP: &[u8] = b"SingleGroup";
-
 type HandlerStreamStepResult = Result<(Option<coppb::Response>, bool)>;
 
-trait RequestHandler: Send {
-    fn handle_request(&mut self) -> Result<coppb::Response> {
+/// An interface for all kind of Coprocessor request handlers.
+#[async_trait]
+pub trait RequestHandler: Send {
+    /// Processes current request and produces a response.
+    async fn handle_request(&mut self) -> Result<coppb::Response> {
         panic!("unary request is not supported for this handler");
     }
 
+    /// Processes current request and produces streaming responses.
     fn handle_streaming_request(&mut self) -> HandlerStreamStepResult {
         panic!("streaming request is not supported for this handler");
     }
 
-    fn collect_metrics_into(&mut self, _metrics: &mut self::dag::executor::ExecutorMetrics) {
+    /// Collects scan statistics generated in this request handler so far.
+    fn collect_scan_statistics(&mut self, _dest: &mut Statistics) {
         // Do nothing by default
     }
 
-    fn into_boxed(self) -> Box<RequestHandler + Send>
+    fn into_boxed(self) -> Box<dyn RequestHandler>
     where
         Self: 'static + Sized,
     {
-        box self
+        Box::new(self)
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct Deadline {
-    /// Used to construct the Error when deadline exceeded
-    tag: &'static str,
-
-    start_time: Instant,
-    deadline: Instant,
-}
-
-impl Deadline {
-    /// Initialize a deadline that counting from current.
-    pub fn from_now(tag: &'static str, after_duration: Duration) -> Self {
-        let start_time = Instant::now_coarse();
-        let deadline = start_time + after_duration;
-        Self {
-            tag,
-            start_time,
-            deadline,
-        }
-    }
-
-    /// Returns error if the deadline is exceeded.
-    pub fn check_if_exceeded(&self) -> Result<()> {
-        let now = Instant::now_coarse();
-        if self.deadline <= now {
-            let elapsed = now.duration_since(self.start_time);
-            return Err(Error::Outdated(elapsed, self.tag));
-        }
-        Ok(())
-    }
-}
-
-/// Denotes for a function that builds a `RequestHandler`.
-/// Due to rust-lang#23856, we have to make it a type alias of `Box<..>`.
 type RequestHandlerBuilder<Snap> =
-    Box<dyn for<'a> FnBox(Snap, &'a ReqContext) -> Result<Box<dyn RequestHandler + Send>> + Send>;
+    Box<dyn for<'a> FnOnce(Snap, &'a ReqContext) -> Result<Box<dyn RequestHandler>> + Send>;
 
 /// Encapsulate the `kvrpcpb::Context` to provide some extra properties.
 #[derive(Debug, Clone)]
@@ -125,19 +102,30 @@ pub struct ReqContext {
 
     /// The transaction start_ts of the request
     pub txn_start_ts: Option<u64>,
+
+    /// The set of timestamps of locks that can be bypassed during the reading.
+    pub bypass_locks: TsSet,
+
+    /// The data version to match. If it matches the underlying data version,
+    /// request will not be processed (i.e. cache hit).
+    ///
+    /// None means don't try to hit the cache.
+    pub cache_match_version: Option<u64>,
 }
 
 impl ReqContext {
     pub fn new(
         tag: &'static str,
-        context: kvrpcpb::Context,
+        mut context: kvrpcpb::Context,
         ranges: &[coppb::KeyRange],
         max_handle_duration: Duration,
         peer: Option<String>,
         is_desc_scan: Option<bool>,
         txn_start_ts: Option<u64>,
+        cache_match_version: Option<u64>,
     ) -> Self {
-        let deadline = Deadline::from_now(tag, max_handle_duration);
+        let deadline = Deadline::from_now(max_handle_duration);
+        let bypass_locks = TsSet::from_u64s(context.take_resolved_locks());
         Self {
             tag,
             context,
@@ -147,6 +135,8 @@ impl ReqContext {
             txn_start_ts,
             first_range: ranges.first().cloned(),
             ranges_len: ranges.len(),
+            bypass_locks,
+            cache_match_version,
         }
     }
 
@@ -154,9 +144,10 @@ impl ReqContext {
     pub fn default_for_test() -> Self {
         Self::new(
             "test",
-            kvrpcpb::Context::new(),
+            kvrpcpb::Context::default(),
             &[],
-            Duration::from_secs(10),
+            Duration::from_secs(100),
+            None,
             None,
             None,
             None,

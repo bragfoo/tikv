@@ -1,33 +1,19 @@
-// Copyright 2018 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
 use super::*;
 
 use protobuf::Message;
-use protobuf::RepeatedField;
 
 use kvproto::coprocessor::{KeyRange, Request};
 use kvproto::kvrpcpb::Context;
-use tipb::executor::{
-    Aggregation, ExecType, Executor, IndexScan, Limit, Selection, TableScan, TopN,
-};
-use tipb::expression::{ByItem, Expr, ExprType};
-use tipb::schema::ColumnInfo;
-use tipb::select::{Chunk, DAGRequest};
+use tipb::ColumnInfo;
+use tipb::{Aggregation, ExecType, Executor, IndexScan, Limit, Selection, TableScan, TopN};
+use tipb::{ByItem, Expr, ExprType};
+use tipb::{Chunk, DagRequest};
 
-use tikv::coprocessor::codec::{datum, table, Datum};
+use tidb_query::codec::{datum, Datum};
 use tikv::coprocessor::REQ_TYPE_DAG;
-use tikv::util::codec::number::NumberEncoder;
+use tikv_util::codec::number::NumberEncoder;
 
 pub struct DAGSelect {
     pub execs: Vec<Executor>,
@@ -42,37 +28,33 @@ pub struct DAGSelect {
 
 impl DAGSelect {
     pub fn from(table: &Table) -> DAGSelect {
-        let mut exec = Executor::new();
+        let mut exec = Executor::default();
         exec.set_tp(ExecType::TypeTableScan);
-        let mut tbl_scan = TableScan::new();
-        let mut table_info = table.get_table_info();
+        let mut tbl_scan = TableScan::default();
+        let mut table_info = table.table_info();
         tbl_scan.set_table_id(table_info.get_table_id());
         let columns_info = table_info.take_columns();
         tbl_scan.set_columns(columns_info);
         exec.set_tbl_scan(tbl_scan);
 
-        let mut range = KeyRange::new();
-        range.set_start(table::encode_row_key(table.id, ::std::i64::MIN));
-        range.set_end(table::encode_row_key(table.id, ::std::i64::MAX));
-
         DAGSelect {
             execs: vec![exec],
-            cols: table.get_table_columns(),
+            cols: table.columns_info(),
             order_by: vec![],
             limit: None,
             aggregate: vec![],
             group_by: vec![],
-            key_range: range,
+            key_range: table.get_record_range_all(),
             output_offsets: None,
         }
     }
 
     pub fn from_index(table: &Table, index: &Column) -> DAGSelect {
         let idx = index.index;
-        let mut exec = Executor::new();
+        let mut exec = Executor::default();
         exec.set_tp(ExecType::TypeIndexScan);
-        let mut scan = IndexScan::new();
-        let mut index_info = table.get_index_info(idx, true);
+        let mut scan = IndexScan::default();
+        let mut index_info = table.index_info(idx, true);
         scan.set_table_id(index_info.get_table_id());
         scan.set_index_id(idx);
 
@@ -80,7 +62,7 @@ impl DAGSelect {
         scan.set_columns(columns_info.clone());
         exec.set_idx_scan(scan);
 
-        let range = table.get_index_range(idx);
+        let range = table.get_index_range_all(idx);
         DAGSelect {
             execs: vec![exec],
             cols: columns_info.to_vec(),
@@ -100,8 +82,8 @@ impl DAGSelect {
 
     pub fn order_by(mut self, col: &Column, desc: bool) -> DAGSelect {
         let col_offset = offset_for_column(&self.cols, col.id);
-        let mut item = ByItem::new();
-        let mut expr = Expr::new();
+        let mut item = ByItem::default();
+        let mut expr = Expr::default();
         expr.set_tp(ExprType::ColumnRef);
         expr.mut_val().encode_i64(col_offset).unwrap();
         item.set_expr(expr);
@@ -111,7 +93,7 @@ impl DAGSelect {
     }
 
     pub fn count(mut self) -> DAGSelect {
-        let mut expr = Expr::new();
+        let mut expr = Expr::default();
         expr.set_tp(ExprType::Count);
         self.aggregate.push(expr);
         self
@@ -119,10 +101,10 @@ impl DAGSelect {
 
     pub fn aggr_col(mut self, col: &Column, aggr_t: ExprType) -> DAGSelect {
         let col_offset = offset_for_column(&self.cols, col.id);
-        let mut col_expr = Expr::new();
+        let mut col_expr = Expr::default();
         col_expr.set_tp(ExprType::ColumnRef);
         col_expr.mut_val().encode_i64(col_offset).unwrap();
-        let mut expr = Expr::new();
+        let mut expr = Expr::default();
         expr.set_tp(aggr_t);
         expr.mut_children().push(col_expr);
         self.aggregate.push(expr);
@@ -150,21 +132,21 @@ impl DAGSelect {
     }
 
     pub fn bit_and(self, col: &Column) -> DAGSelect {
-        self.aggr_col(col, ExprType::Agg_BitAnd)
+        self.aggr_col(col, ExprType::AggBitAnd)
     }
 
     pub fn bit_or(self, col: &Column) -> DAGSelect {
-        self.aggr_col(col, ExprType::Agg_BitOr)
+        self.aggr_col(col, ExprType::AggBitOr)
     }
 
     pub fn bit_xor(self, col: &Column) -> DAGSelect {
-        self.aggr_col(col, ExprType::Agg_BitXor)
+        self.aggr_col(col, ExprType::AggBitXor)
     }
 
     pub fn group_by(mut self, cols: &[&Column]) -> DAGSelect {
         for col in cols {
             let offset = offset_for_column(&self.cols, col.id);
-            let mut expr = Expr::new();
+            let mut expr = Expr::default();
             expr.set_tp(ExprType::ColumnRef);
             expr.mut_val().encode_i64(offset).unwrap();
             self.group_by.push(expr);
@@ -178,9 +160,9 @@ impl DAGSelect {
     }
 
     pub fn where_expr(mut self, expr: Expr) -> DAGSelect {
-        let mut exec = Executor::new();
+        let mut exec = Executor::default();
         exec.set_tp(ExecType::TypeSelection);
-        let mut selection = Selection::new();
+        let mut selection = Selection::default();
         selection.mut_conditions().push(expr);
         exec.set_selection(selection);
         self.execs.push(exec);
@@ -188,49 +170,48 @@ impl DAGSelect {
     }
 
     pub fn build(self) -> Request {
-        self.build_with(Context::new(), &[0])
+        self.build_with(Context::default(), &[0])
     }
 
     pub fn build_with(mut self, ctx: Context, flags: &[u64]) -> Request {
         if !self.aggregate.is_empty() || !self.group_by.is_empty() {
-            let mut exec = Executor::new();
+            let mut exec = Executor::default();
             exec.set_tp(ExecType::TypeAggregation);
-            let mut aggr = Aggregation::new();
+            let mut aggr = Aggregation::default();
             if !self.aggregate.is_empty() {
-                aggr.set_agg_func(RepeatedField::from_vec(self.aggregate));
+                aggr.set_agg_func(self.aggregate.into());
             }
 
             if !self.group_by.is_empty() {
-                aggr.set_group_by(RepeatedField::from_vec(self.group_by));
+                aggr.set_group_by(self.group_by.into());
             }
             exec.set_aggregation(aggr);
             self.execs.push(exec);
         }
 
         if !self.order_by.is_empty() {
-            let mut exec = Executor::new();
+            let mut exec = Executor::default();
             exec.set_tp(ExecType::TypeTopN);
-            let mut topn = TopN::new();
-            topn.set_order_by(RepeatedField::from_vec(self.order_by));
+            let mut topn = TopN::default();
+            topn.set_order_by(self.order_by.into());
             if let Some(limit) = self.limit.take() {
                 topn.set_limit(limit);
             }
-            exec.set_topN(topn);
+            exec.set_top_n(topn);
             self.execs.push(exec);
         }
 
         if let Some(l) = self.limit.take() {
-            let mut exec = Executor::new();
+            let mut exec = Executor::default();
             exec.set_tp(ExecType::TypeLimit);
-            let mut limit = Limit::new();
+            let mut limit = Limit::default();
             limit.set_limit(l);
             exec.set_limit(limit);
             self.execs.push(exec);
         }
 
-        let mut dag = DAGRequest::new();
-        dag.set_executors(RepeatedField::from_vec(self.execs));
-        dag.set_start_ts(next_id() as u64);
+        let mut dag = DagRequest::default();
+        dag.set_executors(self.execs.into());
         dag.set_flags(flags.iter().fold(0, |acc, f| acc | *f));
         dag.set_collect_range_counts(true);
 
@@ -241,10 +222,11 @@ impl DAGSelect {
         };
         dag.set_output_offsets(output_offsets);
 
-        let mut req = Request::new();
+        let mut req = Request::default();
+        req.set_start_ts(next_id() as u64);
         req.set_tp(REQ_TYPE_DAG);
         req.set_data(dag.write_to_bytes().unwrap());
-        req.set_ranges(RepeatedField::from_vec(vec![self.key_range]));
+        req.set_ranges(vec![self.key_range].into());
         req.set_context(ctx);
         req
     }
@@ -281,7 +263,7 @@ impl Iterator for DAGChunkSpliter {
             }
             assert_eq!(self.datums.len() >= self.col_cnt, true);
             let mut cols = self.datums.split_off(self.col_cnt);
-            ::std::mem::swap(&mut self.datums, &mut cols);
+            std::mem::swap(&mut self.datums, &mut cols);
             return Some(cols);
         }
     }

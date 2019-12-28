@@ -1,15 +1,4 @@
-// Copyright 2016 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::fs;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,14 +6,15 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use kvproto::raft_serverpb::RaftMessage;
+use kvproto::raft_serverpb::*;
 use raft::eraftpb::{Message, MessageType};
 
+use engine::Peekable;
 use test_raftstore::*;
-use tikv::raftstore::store::Msg;
+use tikv::raftstore::store::*;
 use tikv::raftstore::Result;
-use tikv::util::config::*;
-use tikv::util::HandyRwLock;
+use tikv_util::config::*;
+use tikv_util::HandyRwLock;
 
 fn test_huge_snapshot<T: Simulator>(cluster: &mut Cluster<T>) {
     cluster.cfg.raft_store.raft_log_gc_count_limit = 1000;
@@ -60,7 +50,10 @@ fn test_huge_snapshot<T: Simulator>(cluster: &mut Cluster<T>) {
     let stale = Arc::new(AtomicBool::new(false));
     cluster.sim.wl().add_recv_filter(
         3,
-        box LeadingDuplicatedSnapshotFilter::new(Arc::clone(&stale)),
+        Box::new(LeadingDuplicatedSnapshotFilter::new(
+            Arc::clone(&stale),
+            false,
+        )),
     );
     pd_client.must_add_peer(r1, new_peer(3, 3));
     let mut i = 2 * 1024;
@@ -116,7 +109,7 @@ fn test_server_snap_gc() {
     cluster
         .sim
         .wl()
-        .add_recv_filter(3, box DropSnapshotFilter::new(tx));
+        .add_recv_filter(3, Box::new(DropSnapshotFilter::new(tx)));
     pd_client.must_add_peer(r1, new_peer(3, 3));
 
     let first_snap_idx = rx.recv_timeout(Duration::from_secs(3)).unwrap();
@@ -179,8 +172,6 @@ fn test_server_snap_gc() {
         if now.elapsed() > Duration::from_secs(10) {
             panic!("snap files is still not empty: {:?}", snap_files);
         }
-        // trigger log compaction.
-        cluster.must_put(b"k2", b"v2");
         sleep_ms(20);
     }
 }
@@ -212,7 +203,7 @@ fn test_concurrent_snap<T: Simulator>(cluster: &mut Cluster<T>) {
     cluster
         .sim
         .wl()
-        .add_recv_filter(3, box CollectSnapshotFilter::new(tx));
+        .add_recv_filter(3, Box::new(CollectSnapshotFilter::new(tx)));
     pd_client.must_add_peer(r1, new_peer(3, 3));
     let region = cluster.get_region(b"k1");
     // Ensure the snapshot of range ("", "") is sent and piled in filter.
@@ -273,7 +264,7 @@ fn test_cf_snapshot<T: Simulator>(cluster: &mut Cluster<T>) {
 
     // test if node can be safely restarted without losing any data.
     cluster.stop_node(1);
-    cluster.run_node(1);
+    cluster.run_node(1).unwrap();
 
     cluster.must_put_cf(cf, b"k3", b"v3");
     must_get_cf_equal(&engine1, cf, b"k3", b"v3");
@@ -302,7 +293,7 @@ struct StaleSnapInner {
     sent: Mutex<Sender<()>>,
 }
 
-impl Filter<RaftMessage> for StaleSnap {
+impl Filter for StaleSnap {
     fn before(&self, msgs: &mut Vec<RaftMessage>) -> Result<()> {
         let mut res = Vec::with_capacity(msgs.len());
         for mut m in msgs.drain(..) {
@@ -372,7 +363,7 @@ fn test_node_stale_snap() {
 /// Pause Snap and wait till first append message arrives.
 pub struct SnapshotAppendFilter {
     stale: AtomicBool,
-    pending_msg: Mutex<Vec<Msg>>,
+    pending_msg: Mutex<Vec<RaftMessage>>,
     notifier: Mutex<Sender<()>>,
 }
 
@@ -386,30 +377,27 @@ impl SnapshotAppendFilter {
     }
 }
 
-impl Filter<Msg> for SnapshotAppendFilter {
-    fn before(&self, msgs: &mut Vec<Msg>) -> Result<()> {
+impl Filter for SnapshotAppendFilter {
+    fn before(&self, msgs: &mut Vec<RaftMessage>) -> Result<()> {
         if self.stale.load(Ordering::Relaxed) {
             return Ok(());
         }
         let mut to_send = vec![];
         let mut pending_msg = self.pending_msg.lock().unwrap();
         let mut stale = false;
-        for m in msgs.drain(..) {
-            let mut should_collect = false;
-            if let Msg::RaftMessage(ref msg) = m {
-                should_collect =
-                    !stale && msg.get_message().get_msg_type() == MessageType::MsgSnapshot;
-                stale = !pending_msg.is_empty()
-                    && msg.get_message().get_msg_type() == MessageType::MsgAppend;
-            }
+        for msg in msgs.drain(..) {
+            let should_collect =
+                !stale && msg.get_message().get_msg_type() == MessageType::MsgSnapshot;
+            stale = !pending_msg.is_empty()
+                && msg.get_message().get_msg_type() == MessageType::MsgAppend;
             if should_collect {
-                pending_msg.push(m);
+                pending_msg.push(msg);
                 self.notifier.lock().unwrap().send(()).unwrap();
             } else {
                 if stale {
                     to_send.extend(pending_msg.drain(..));
                 }
-                to_send.push(m);
+                to_send.push(msg);
             }
         }
         self.stale.store(stale, Ordering::SeqCst);
@@ -426,13 +414,15 @@ fn test_snapshot_with_append<T: Simulator>(cluster: &mut Cluster<T>) {
     pd_client.disable_default_operator();
     cluster.run();
 
+    // In case of removing leader, let's transfer leader to some node first.
+    cluster.must_transfer_leader(1, new_peer(1, 1));
     pd_client.must_remove_peer(1, new_peer(4, 4));
 
     let (tx, rx) = mpsc::channel();
     cluster
         .sim
         .wl()
-        .add_recv_filter(4, box SnapshotAppendFilter::new(tx));
+        .add_recv_filter(4, Box::new(SnapshotAppendFilter::new(tx)));
     pd_client.add_peer(1, new_peer(4, 5));
     rx.recv_timeout(Duration::from_secs(3)).unwrap();
     cluster.must_put(b"k1", b"v1");
@@ -452,4 +442,41 @@ fn test_node_snapshot_with_append() {
 fn test_server_snapshot_with_append() {
     let mut cluster = new_server_cluster(0, 4);
     test_snapshot_with_append(&mut cluster);
+}
+
+#[test]
+fn test_request_snapshot_apply_repeatedly() {
+    let mut cluster = new_node_cluster(0, 2);
+    configure_for_request_snapshot(&mut cluster);
+
+    let pd_client = Arc::clone(&cluster.pd_client);
+    // Disable default max peer count check.
+    pd_client.disable_default_operator();
+    let region_id = cluster.run_conf_change();
+    pd_client.must_add_peer(region_id, new_peer(2, 2));
+    cluster.must_transfer_leader(region_id, new_peer(2, 2));
+
+    sleep_ms(200);
+    // Install snapshot filter before requesting snapshot.
+    let (tx, rx) = mpsc::channel();
+    let notifier = Mutex::new(Some(tx));
+    cluster.sim.wl().add_recv_filter(
+        1,
+        Box::new(RecvSnapshotFilter {
+            notifier,
+            region_id,
+        }),
+    );
+    cluster.must_request_snapshot(1, region_id);
+    rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    sleep_ms(200);
+    let engine = cluster.get_raft_engine(1);
+    let raft_key = keys::raft_state_key(region_id);
+    let raft_state: RaftLocalState = engine.get_msg(&raft_key).unwrap().unwrap();
+    assert!(
+        raft_state.get_last_index() > RAFT_INIT_LOG_INDEX,
+        "{:?}",
+        raft_state
+    );
 }

@@ -1,31 +1,21 @@
-// Copyright 2017 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::iter::*;
-use std::sync::Arc;
+use std::sync::*;
 use std::thread;
 use std::time::Duration;
 
 use kvproto::raft_cmdpb::CmdType;
 use kvproto::raft_serverpb::{PeerState, RegionLocalState};
+use raft::eraftpb::MessageType;
 
+use engine::Peekable;
+use engine::{CF_RAFT, CF_WRITE};
+use pd_client::PdClient;
 use test_raftstore::*;
-use tikv::pd::PdClient;
-use tikv::raftstore::store::keys;
-use tikv::raftstore::store::Peekable;
-use tikv::storage::{CF_RAFT, CF_WRITE};
-use tikv::util::config::*;
-use tikv::util::HandyRwLock;
+use tikv::raftstore::store::*;
+use tikv_util::config::*;
+use tikv_util::HandyRwLock;
 
 /// Test if merge is working as expected in a general condition.
 #[test]
@@ -37,6 +27,10 @@ fn test_node_base_merge() {
 
     cluster.must_put(b"k1", b"v1");
     cluster.must_put(b"k3", b"v3");
+    for i in 0..3 {
+        must_get_equal(&cluster.get_engine(i + 1), b"k1", b"v1");
+        must_get_equal(&cluster.get_engine(i + 1), b"k3", b"v3");
+    }
 
     let pd_client = Arc::clone(&cluster.pd_client);
     let region = pd_client.get_region(b"k1").unwrap();
@@ -69,11 +63,11 @@ fn test_node_base_merge() {
     assert_eq!(region.get_id(), right.get_id());
     assert_eq!(region.get_start_key(), left.get_start_key());
     assert_eq!(region.get_end_key(), right.get_end_key());
-    let orgin_epoch = left.get_region_epoch();
+    let origin_epoch = left.get_region_epoch();
     let new_epoch = region.get_region_epoch();
     // PrepareMerge + CommitMerge, so it should be 2.
-    assert_eq!(new_epoch.get_version(), orgin_epoch.get_version() + 2);
-    assert_eq!(new_epoch.get_conf_ver(), orgin_epoch.get_conf_ver());
+    assert_eq!(new_epoch.get_version(), origin_epoch.get_version() + 2);
+    assert_eq!(new_epoch.get_conf_ver(), origin_epoch.get_conf_ver());
     let get = new_request(
         region.get_id(),
         new_epoch.to_owned(),
@@ -112,10 +106,60 @@ fn test_node_base_merge() {
     cluster.must_put(b"k4", b"v4");
 }
 
+#[test]
+fn test_node_merge_with_slow_learner() {
+    let mut cluster = new_node_cluster(0, 2);
+    configure_for_merge(&mut cluster);
+    cluster.pd_client.disable_default_operator();
+
+    // Create a cluster with peer 1 as leader and peer 2 as learner.
+    let r1 = cluster.run_conf_change();
+    let pd_client = Arc::clone(&cluster.pd_client);
+    pd_client.must_add_peer(r1, new_learner_peer(2, 2));
+
+    // Split the region.
+    let pd_client = Arc::clone(&cluster.pd_client);
+    let region = pd_client.get_region(b"k1").unwrap();
+    cluster.must_split(&region, b"k2");
+    let left = pd_client.get_region(b"k1").unwrap();
+    let right = pd_client.get_region(b"k2").unwrap();
+    assert_eq!(region.get_id(), right.get_id());
+    assert_eq!(left.get_end_key(), right.get_start_key());
+    assert_eq!(right.get_start_key(), b"k2");
+
+    // Make sure the leader has received the learner's last index.
+    cluster.must_put(b"k1", b"v1");
+    cluster.must_put(b"k3", b"v3");
+    must_get_equal(&cluster.get_engine(2), b"k1", b"v1");
+    must_get_equal(&cluster.get_engine(2), b"k3", b"v3");
+
+    cluster.add_send_filter(IsolationFilterFactory::new(2));
+    (0..100).for_each(|i| cluster.must_put(b"k1", format!("v{}", i).as_bytes()));
+
+    // Merge 2 regions under isolation should fail.
+    let merge = new_prepare_merge(right.clone());
+    let req = new_admin_request(left.get_id(), left.get_region_epoch(), merge);
+    let resp = cluster
+        .call_command_on_leader(req, Duration::from_secs(3))
+        .unwrap();
+    assert!(resp
+        .get_header()
+        .get_error()
+        .get_message()
+        .contains("log gap"));
+
+    cluster.clear_send_filters();
+    cluster.must_put(b"k11", b"v100");
+    must_get_equal(&cluster.get_engine(1), b"k11", b"v100");
+    must_get_equal(&cluster.get_engine(2), b"k11", b"v100");
+    pd_client.must_merge(left.get_id(), right.get_id());
+}
+
 /// Test whether merge will be aborted if prerequisites is not met.
+// FIXME(nrc) failing on CI only
+#[cfg(feature = "protobuf-codec")]
 #[test]
 fn test_node_merge_prerequisites_check() {
-    // ::init_log();
     let mut cluster = new_node_cluster(0, 3);
     configure_for_merge(&mut cluster);
     let pd_client = Arc::clone(&cluster.pd_client);
@@ -185,7 +229,6 @@ fn test_node_merge_prerequisites_check() {
 /// Test if stale peer will be handled properly after merge.
 #[test]
 fn test_node_check_merged_message() {
-    // ::init_log();
     let mut cluster = new_node_cluster(0, 4);
     configure_for_merge(&mut cluster);
     let pd_client = Arc::clone(&cluster.pd_client);
@@ -264,10 +307,82 @@ fn test_node_check_merged_message() {
     must_get_none(&engine3, b"v5");
 }
 
+#[test]
+fn test_node_merge_slow_split_right() {
+    test_node_merge_slow_split(true);
+}
+
+#[test]
+fn test_node_merge_slow_split_left() {
+    test_node_merge_slow_split(false);
+}
+
+// Test if a merge handled properly when there is a unfinished slow split before merge.
+fn test_node_merge_slow_split(is_right_derive: bool) {
+    let mut cluster = new_node_cluster(0, 3);
+    configure_for_merge(&mut cluster);
+    let pd_client = Arc::clone(&cluster.pd_client);
+    pd_client.disable_default_operator();
+    cluster.cfg.raft_store.right_derive_when_split = is_right_derive;
+
+    cluster.run();
+
+    cluster.must_put(b"k1", b"v1");
+    cluster.must_put(b"k3", b"v3");
+
+    let region = pd_client.get_region(b"k1").unwrap();
+    cluster.must_split(&region, b"k2");
+    let left = pd_client.get_region(b"k1").unwrap();
+    let right = pd_client.get_region(b"k3").unwrap();
+
+    let target_leader = right
+        .get_peers()
+        .iter()
+        .find(|p| p.get_store_id() == 1)
+        .unwrap()
+        .clone();
+    cluster.must_transfer_leader(right.get_id(), target_leader);
+    let target_leader = left
+        .get_peers()
+        .iter()
+        .find(|p| p.get_store_id() == 2)
+        .unwrap()
+        .clone();
+    cluster.must_transfer_leader(left.get_id(), target_leader);
+    must_get_equal(&cluster.get_engine(1), b"k3", b"v3");
+
+    // So cluster becomes:
+    //  left region: 1         2(leader) I 3
+    // right region: 1(leader) 2         I 3
+    // I means isolation.(here just means 3 can not receive append log)
+    cluster.add_send_filter(CloneFilterFactory(
+        RegionPacketFilter::new(left.get_id(), 3)
+            .direction(Direction::Recv)
+            .msg_type(MessageType::MsgAppend),
+    ));
+    cluster.add_send_filter(CloneFilterFactory(
+        RegionPacketFilter::new(right.get_id(), 3)
+            .direction(Direction::Recv)
+            .msg_type(MessageType::MsgAppend),
+    ));
+    cluster.must_split(&right, b"k3");
+
+    // left region and right region on store 3 fall behind
+    // so after split, the new generated region is not on store 3 now
+    let right1 = pd_client.get_region(b"k2").unwrap();
+    let right2 = pd_client.get_region(b"k3").unwrap();
+    assert_ne!(right1.get_id(), right2.get_id());
+    pd_client.must_merge(left.get_id(), right1.get_id());
+    // after merge, the left region still exists on store 3
+
+    cluster.must_put(b"k0", b"v0");
+    cluster.clear_send_filters();
+    must_get_equal(&cluster.get_engine(3), b"k0", b"v0");
+}
+
 /// Test various cases that a store is isolated during merge.
 #[test]
 fn test_node_merge_dist_isolation() {
-    // ::init_log();
     let mut cluster = new_node_cluster(0, 3);
     configure_for_merge(&mut cluster);
     let pd_client = Arc::clone(&cluster.pd_client);
@@ -339,11 +454,10 @@ fn test_node_merge_dist_isolation() {
     must_get_equal(&cluster.get_engine(3), b"k4", b"v4");
 }
 
-/// Similiar to `test_node_merge_dist_isolation`, but make the isolated store
+/// Similar to `test_node_merge_dist_isolation`, but make the isolated store
 /// way behind others so others have to send it a snapshot.
 #[test]
 fn test_node_merge_brain_split() {
-    // ::init_log();
     let mut cluster = new_node_cluster(0, 3);
     configure_for_merge(&mut cluster);
     cluster.cfg.raft_store.raft_log_gc_threshold = 12;
@@ -374,6 +488,10 @@ fn test_node_merge_brain_split() {
     must_get_equal(&cluster.get_engine(3), b"k21", b"v21");
 
     cluster.add_send_filter(IsolationFilterFactory::new(3));
+    // So cluster becomes:
+    //  left region: 1(leader) 2 I 3
+    // right region: 1(leader) 2 I 3
+    // I means isolation.
     pd_client.must_merge(left.get_id(), right.get_id());
 
     for i in 0..100 {
@@ -384,9 +502,13 @@ fn test_node_merge_brain_split() {
 
     cluster.clear_send_filters();
 
-    cluster.must_transfer_leader(1, new_peer(3, 3));
+    // Wait until store 3 get data after merging
+    must_get_equal(&cluster.get_engine(3), b"k40", b"v4");
+    let right_peer_3 = find_peer(&right, 3).cloned().unwrap();
+    cluster.must_transfer_leader(right.get_id(), right_peer_3);
     cluster.must_put(b"k40", b"v5");
 
+    // Make sure the two regions are already merged on store 3.
     let state_key = keys::region_state_key(left.get_id());
     let state: RegionLocalState = cluster
         .get_engine(3)
@@ -589,6 +711,59 @@ fn test_node_merge_update_region() {
     assert_eq!(resp.get_responses()[0].get_get().get_value(), b"v3");
 }
 
+/// Test if merge is working properly when merge entries is empty but commit index is not updated.
+#[test]
+fn test_node_merge_catch_up_logs_empty_entries() {
+    let mut cluster = new_node_cluster(0, 3);
+    configure_for_merge(&mut cluster);
+    cluster.run();
+
+    cluster.must_put(b"k1", b"v1");
+    cluster.must_put(b"k3", b"v3");
+
+    let pd_client = Arc::clone(&cluster.pd_client);
+    let region = pd_client.get_region(b"k1").unwrap();
+    let peer_on_store1 = find_peer(&region, 1).unwrap().to_owned();
+    cluster.must_transfer_leader(region.get_id(), peer_on_store1);
+    cluster.must_split(&region, b"k2");
+    let left = pd_client.get_region(b"k1").unwrap();
+    let right = pd_client.get_region(b"k2").unwrap();
+
+    // make sure the peer of left region on engine 3 has caught up logs.
+    cluster.must_put(b"k0", b"v0");
+    must_get_equal(&cluster.get_engine(3), b"k0", b"v0");
+
+    // first MsgAppend will append log, second MsgAppend will set commit index,
+    // So only allowing first MsgAppend to make source peer have uncommitted entries.
+    cluster.add_send_filter(CloneFilterFactory(
+        RegionPacketFilter::new(left.get_id(), 3)
+            .direction(Direction::Recv)
+            .msg_type(MessageType::MsgAppend)
+            .allow(1),
+    ));
+    // make the source peer have no way to know the uncommitted entries can be applied from heartbeat.
+    cluster.add_send_filter(CloneFilterFactory(
+        RegionPacketFilter::new(left.get_id(), 3)
+            .msg_type(MessageType::MsgHeartbeat)
+            .direction(Direction::Recv),
+    ));
+    // make the source peer have no way to know the uncommitted entries can be applied from target region.
+    cluster.add_send_filter(CloneFilterFactory(
+        RegionPacketFilter::new(right.get_id(), 3)
+            .msg_type(MessageType::MsgAppend)
+            .direction(Direction::Recv),
+    ));
+    pd_client.must_merge(left.get_id(), right.get_id());
+    cluster.must_region_not_exist(left.get_id(), 2);
+    cluster.shutdown();
+    cluster.clear_send_filters();
+
+    // as expected, merge process will forward the commit index
+    // and the source peer will be destroyed.
+    cluster.start().unwrap();
+    cluster.must_region_not_exist(left.get_id(), 3);
+}
+
 #[test]
 fn test_merge_with_slow_promote() {
     let mut cluster = new_node_cluster(0, 3);
@@ -613,11 +788,62 @@ fn test_merge_with_slow_promote() {
     must_get_equal(&cluster.get_engine(3), b"k1", b"v1");
     must_get_equal(&cluster.get_engine(3), b"k3", b"v3");
 
-    let delay_filter = box DelayFilter::new(Duration::from_millis(20));
+    let delay_filter =
+        Box::new(RegionPacketFilter::new(right.get_id(), 3).direction(Direction::Recv));
     cluster.sim.wl().add_send_filter(3, delay_filter);
 
     pd_client.must_add_peer(right.get_id(), new_peer(3, right.get_id() + 3));
     pd_client.must_merge(right.get_id(), left.get_id());
     cluster.sim.wl().clear_send_filters(3);
     cluster.must_transfer_leader(left.get_id(), new_peer(3, left.get_id() + 3));
+}
+
+#[test]
+fn test_request_snapshot_after_propose_merge() {
+    let mut cluster = new_node_cluster(0, 3);
+    configure_for_merge(&mut cluster);
+    let pd_client = Arc::clone(&cluster.pd_client);
+    pd_client.disable_default_operator();
+
+    cluster.run();
+
+    let region = pd_client.get_region(b"k1").unwrap();
+    cluster.must_split(&region, b"k2");
+
+    cluster.must_put(b"k1", b"v1");
+    cluster.must_put(b"k3", b"v3");
+
+    let region = pd_client.get_region(b"k3").unwrap();
+    let target_region = pd_client.get_region(b"k1").unwrap();
+
+    // Make sure peer 1 is the leader.
+    cluster.must_transfer_leader(region.get_id(), new_peer(1, 1));
+
+    // Drop append messages, so prepare merge can not be committed.
+    cluster.add_send_filter(CloneFilterFactory(DropMessageFilter::new(
+        MessageType::MsgAppend,
+    )));
+    let prepare_merge = new_prepare_merge(target_region);
+    let mut req = new_admin_request(region.get_id(), region.get_region_epoch(), prepare_merge);
+    req.mut_header().set_peer(new_peer(1, 1));
+    cluster
+        .sim
+        .rl()
+        .async_command_on_node(1, req, Callback::None)
+        .unwrap();
+    sleep_ms(200);
+
+    // Install snapshot filter before requesting snapshot.
+    let (tx, rx) = mpsc::channel();
+    let notifier = Mutex::new(Some(tx));
+    cluster.sim.wl().add_recv_filter(
+        2,
+        Box::new(RecvSnapshotFilter {
+            notifier,
+            region_id: region.get_id(),
+        }),
+    );
+    cluster.must_request_snapshot(2, region.get_id());
+    // Leader should reject request snapshot if there is any proposed merge.
+    rx.recv_timeout(Duration::from_millis(500)).unwrap_err();
 }

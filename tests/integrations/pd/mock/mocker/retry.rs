@@ -1,22 +1,11 @@
-// Copyright 2017 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 
 use kvproto::pdpb::*;
-use tikv::pd::RECONNECT_INTERVAL_SEC;
+use pd_client::RECONNECT_INTERVAL_SEC;
 
 use super::*;
 
@@ -49,10 +38,10 @@ impl Retry {
 }
 
 impl PdMocker for Retry {
-    fn get_region_by_id(&self, _: &GetRegionByIDRequest) -> Option<Result<GetRegionResponse>> {
+    fn get_region_by_id(&self, _: &GetRegionByIdRequest) -> Option<Result<GetRegionResponse>> {
         if self.is_ok() {
             info!("[Retry] get_region_by_id returns Ok(_)");
-            Some(Ok(GetRegionResponse::new()))
+            Some(Ok(GetRegionResponse::default()))
         } else {
             info!("[Retry] get_region_by_id returns Err(_)");
             Some(Err("please retry".to_owned()))
@@ -62,7 +51,7 @@ impl PdMocker for Retry {
     fn get_store(&self, _: &GetStoreRequest) -> Option<Result<GetStoreResponse>> {
         if self.is_ok() {
             info!("[Retry] get_store returns Ok(_)");
-            Some(Ok(GetStoreResponse::new()))
+            Some(Ok(GetStoreResponse::default()))
         } else {
             info!("[Retry] get_store returns Err(_)");
             Some(Err("please retry".to_owned()))
@@ -88,35 +77,35 @@ impl NotRetry {
 }
 
 impl PdMocker for NotRetry {
-    fn get_region_by_id(&self, _: &GetRegionByIDRequest) -> Option<Result<GetRegionResponse>> {
+    fn get_region_by_id(&self, _: &GetRegionByIdRequest) -> Option<Result<GetRegionResponse>> {
         if !self.is_visited.swap(true, Ordering::Relaxed) {
             info!(
-                "[NotRetry] get_region_by_id returns Ok(_) with header has INCOMPATIBLE_VERSION error"
+                "[NotRetry] get_region_by_id returns Ok(_) with header has IncompatibleVersion error"
             );
-            let mut err = Error::new();
-            err.set_field_type(ErrorType::INCOMPATIBLE_VERSION);
-            let mut resp = GetRegionResponse::new();
+            let mut err = Error::default();
+            err.set_type(ErrorType::IncompatibleVersion);
+            let mut resp = GetRegionResponse::default();
             resp.mut_header().set_error(err);
             Some(Ok(resp))
         } else {
             info!("[NotRetry] get_region_by_id returns Ok()");
-            Some(Ok(GetRegionResponse::new()))
+            Some(Ok(GetRegionResponse::default()))
         }
     }
 
     fn get_store(&self, _: &GetStoreRequest) -> Option<Result<GetStoreResponse>> {
         if !self.is_visited.swap(true, Ordering::Relaxed) {
             info!(
-                "[NotRetry] get_region_by_id returns Ok(_) with header has INCOMPATIBLE_VERSION error"
+                "[NotRetry] get_region_by_id returns Ok(_) with header has IncompatibleVersion error"
             );
-            let mut err = Error::new();
-            err.set_field_type(ErrorType::INCOMPATIBLE_VERSION);
-            let mut resp = GetStoreResponse::new();
+            let mut err = Error::default();
+            err.set_type(ErrorType::IncompatibleVersion);
+            let mut resp = GetStoreResponse::default();
             resp.mut_header().set_error(err);
             Some(Ok(resp))
         } else {
             info!("[NotRetry] get_region_by_id returns Ok()");
-            Some(Ok(GetStoreResponse::new()))
+            Some(Ok(GetStoreResponse::default()))
         }
     }
 }

@@ -1,25 +1,12 @@
-// Copyright 2016 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
 use super::{AdminObserver, Coprocessor, ObserverContext, Result as CopResult};
-use coprocessor::codec::table;
-use util::codec::bytes::{self, encode_bytes};
-use util::escape;
+use tidb_query::codec::table;
+use tikv_util::codec::bytes::{self, encode_bytes};
 
+use crate::raftstore::store::util;
 use kvproto::metapb::Region;
 use kvproto::raft_cmdpb::{AdminCmdType, AdminRequest, SplitRequest};
-use protobuf::RepeatedField;
-use raftstore::store::util;
 use std::result::Result as StdResult;
 
 /// `SplitObserver` adjusts the split key so that it won't separate
@@ -57,15 +44,19 @@ impl SplitObserver {
         match util::check_key_in_region_exclusive(&key, region) {
             Ok(()) => Ok(key),
             Err(_) => Err(format!(
-                "key \"{}\" should be in (\"{}\", \"{}\")",
-                escape(&key),
-                escape(region.get_start_key()),
-                escape(region.get_end_key()),
+                "key {} should be in ({}, {})",
+                hex::encode_upper(&key),
+                hex::encode_upper(region.get_start_key()),
+                hex::encode_upper(region.get_end_key()),
             )),
         }
     }
 
-    fn on_split(&self, ctx: &mut ObserverContext, splits: &mut Vec<SplitRequest>) -> Result<()> {
+    fn on_split(
+        &self,
+        ctx: &mut ObserverContext<'_>,
+        splits: &mut Vec<SplitRequest>,
+    ) -> Result<()> {
         let (mut i, mut j) = (0, 0);
         let mut last_valid_key: Option<Vec<u8>> = None;
         let region_id = ctx.region().get_id();
@@ -79,11 +70,11 @@ impl SplitObserver {
                     Ok(key) => {
                         if last_valid_key.as_ref().map_or(false, |k| *k >= key) {
                             warn!(
-                                "[region {}] key {} is not larger than previous {} at {}, skip.",
-                                region_id,
-                                escape(&key),
-                                escape(last_valid_key.as_ref().unwrap()),
-                                k
+                                "key is not larger than previous, skip.";
+                                "region_id" => region_id,
+                                "key" => log_wrappers::Key(&key),
+                                "previous" => log_wrappers::Key(last_valid_key.as_ref().unwrap()),
+                                "index" => k,
                             );
                             continue;
                         }
@@ -91,7 +82,12 @@ impl SplitObserver {
                         split.set_split_key(key)
                     }
                     Err(e) => {
-                        warn!("[region {}] invalid key at {}, skip: {:?}", region_id, k, e);
+                        warn!(
+                            "invalid key, skip";
+                            "region_id" => region_id,
+                            "index" => k,
+                            "err" => ?e,
+                        );
                         continue;
                     }
                 }
@@ -114,7 +110,7 @@ impl Coprocessor for SplitObserver {}
 impl AdminObserver for SplitObserver {
     fn pre_propose_admin(
         &self,
-        ctx: &mut ObserverContext,
+        ctx: &mut ObserverContext<'_>,
         req: &mut AdminRequest,
     ) -> CopResult<()> {
         match req.get_cmd_type() {
@@ -129,9 +125,9 @@ impl AdminObserver for SplitObserver {
                 let mut request = vec![req.take_split()];
                 if let Err(e) = self.on_split(ctx, &mut request) {
                     error!(
-                        "[region {}] failed to handle split req: {:?}",
-                        ctx.region().get_id(),
-                        e
+                        "failed to handle split req";
+                        "region_id" => ctx.region().get_id(),
+                        "err" => ?e,
                     );
                     return Err(box_err!(e));
                 }
@@ -147,17 +143,16 @@ impl AdminObserver for SplitObserver {
                             .to_owned()
                     ));
                 }
-                let mut requests = req.mut_splits().take_requests().into_vec();
+                let mut requests = req.mut_splits().take_requests().into();
                 if let Err(e) = self.on_split(ctx, &mut requests) {
                     error!(
-                        "[region {}] failed to handle split req: {:?}",
-                        ctx.region().get_id(),
-                        e
+                        "failed to handle split req";
+                        "region_id" => ctx.region().get_id(),
+                        "err" => ?e,
                     );
                     return Err(box_err!(e));
                 }
-                req.mut_splits()
-                    .set_requests(RepeatedField::from_vec(requests));
+                req.mut_splits().set_requests(requests.into());
             }
             _ => return Ok(()),
         }
@@ -168,28 +163,29 @@ impl AdminObserver for SplitObserver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::raftstore::coprocessor::AdminObserver;
+    use crate::raftstore::coprocessor::ObserverContext;
     use byteorder::{BigEndian, WriteBytesExt};
-    use coprocessor::codec::{datum, table, Datum};
     use kvproto::metapb::Region;
     use kvproto::raft_cmdpb::{AdminCmdType, AdminRequest, SplitRequest};
-    use raftstore::coprocessor::AdminObserver;
-    use raftstore::coprocessor::ObserverContext;
-    use util::codec::bytes::encode_bytes;
+    use tidb_query::codec::{datum, table, Datum};
+    use tidb_query::expr::EvalContext;
+    use tikv_util::codec::bytes::encode_bytes;
 
     fn new_split_request(key: &[u8]) -> AdminRequest {
-        let mut req = AdminRequest::new();
+        let mut req = AdminRequest::default();
         req.set_cmd_type(AdminCmdType::Split);
-        let mut split_req = SplitRequest::new();
+        let mut split_req = SplitRequest::default();
         split_req.set_split_key(key.to_vec());
         req.set_split(split_req);
         req
     }
 
     fn new_batch_split_request(keys: Vec<Vec<u8>>) -> AdminRequest {
-        let mut req = AdminRequest::new();
+        let mut req = AdminRequest::default();
         req.set_cmd_type(AdminCmdType::BatchSplit);
         for key in keys {
-            let mut split_req = SplitRequest::new();
+            let mut split_req = SplitRequest::default();
             split_req.set_split_key(key);
             req.mut_splits().mut_requests().push(split_req);
         }
@@ -204,8 +200,11 @@ mod tests {
     }
 
     fn new_index_key(table_id: i64, idx_id: i64, datums: &[Datum], version_id: u64) -> Vec<u8> {
-        let mut key =
-            table::encode_index_seek_key(table_id, idx_id, &datum::encode_key(datums).unwrap());
+        let mut key = table::encode_index_seek_key(
+            table_id,
+            idx_id,
+            &datum::encode_key(&mut EvalContext::default(), datums).unwrap(),
+        );
         key = encode_bytes(&key);
         key.write_u64::<BigEndian>(version_id).unwrap();
         key
@@ -215,7 +214,7 @@ mod tests {
     fn test_forget_encode() {
         let region_start_key = new_row_key(256, 1, 0);
         let key = new_row_key(256, 2, 0);
-        let mut r = Region::new();
+        let mut r = Region::default();
         r.set_id(10);
         r.set_start_key(region_start_key);
 
@@ -235,11 +234,11 @@ mod tests {
 
     #[test]
     fn test_split() {
-        let mut region = Region::new();
+        let mut region = Region::default();
         let start_key = new_row_key(1, 1, 1);
         region.set_start_key(start_key.clone());
         let mut ctx = ObserverContext::new(&region);
-        let mut req = AdminRequest::new();
+        let mut req = AdminRequest::default();
 
         let observer = SplitObserver;
 

@@ -1,36 +1,18 @@
-// Copyright 2018 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
 use super::*;
 
 use kvproto::kvrpcpb::Context;
 
-use tikv::coprocessor::codec::Datum;
-use tikv::coprocessor::{Endpoint, ReadPoolContext};
-use tikv::server::readpool::{self, ReadPool};
+use tidb_query::codec::Datum;
+use tikv::config::CoprReadPoolConfig;
+use tikv::coprocessor::{readpool_impl, Endpoint};
 use tikv::server::Config;
-use tikv::storage::engine::RocksEngine;
+use tikv::storage::kv::RocksEngine;
 use tikv::storage::{Engine, TestEngineBuilder};
-use tikv::util::worker::FutureWorker;
 
-/// An example table for test purpose.
 #[derive(Clone)]
-pub struct ProductTable {
-    pub id: Column,
-    pub name: Column,
-    pub count: Column,
-    pub table: Table,
-}
+pub struct ProductTable(Table);
 
 impl ProductTable {
     pub fn new() -> ProductTable {
@@ -48,17 +30,19 @@ impl ProductTable {
             .index_key(idx_id)
             .build();
         let table = TableBuilder::new()
-            .add_col(id.clone())
-            .add_col(name.clone())
-            .add_col(count.clone())
+            .add_col("id", id)
+            .add_col("name", name)
+            .add_col("count", count)
             .build();
+        ProductTable(table)
+    }
+}
 
-        ProductTable {
-            id,
-            name,
-            count,
-            table,
-        }
+impl std::ops::Deref for ProductTable {
+    type Target = Table;
+
+    fn deref(&self) -> &Table {
+        &self.0
     }
 }
 
@@ -69,15 +53,7 @@ pub fn init_data_with_engine_and_commit<E: Engine>(
     vals: &[(i64, Option<&str>, i64)],
     commit: bool,
 ) -> (Store<E>, Endpoint<E>) {
-    init_data_with_details(
-        ctx,
-        engine,
-        tbl,
-        vals,
-        commit,
-        &Config::default(),
-        &readpool::Config::default_for_test(),
-    )
+    init_data_with_details(ctx, engine, tbl, vals, commit, &Config::default())
 }
 
 pub fn init_data_with_details<E: Engine>(
@@ -87,27 +63,27 @@ pub fn init_data_with_details<E: Engine>(
     vals: &[(i64, Option<&str>, i64)],
     commit: bool,
     cfg: &Config,
-    read_pool_cfg: &readpool::Config,
 ) -> (Store<E>, Endpoint<E>) {
     let mut store = Store::from_engine(engine);
 
     store.begin();
     for &(id, name, count) in vals {
         store
-            .insert_into(&tbl.table)
-            .set(&tbl.id, Datum::I64(id))
-            .set(&tbl.name, name.map(|s| s.as_bytes()).into())
-            .set(&tbl.count, Datum::I64(count))
+            .insert_into(&tbl)
+            .set(&tbl["id"], Datum::I64(id))
+            .set(&tbl["name"], name.map(str::as_bytes).into())
+            .set(&tbl["count"], Datum::I64(count))
             .execute_with_ctx(ctx.clone());
     }
     if commit {
         store.commit_with_ctx(ctx);
     }
-    let pd_worker = FutureWorker::new("test-pd-worker");
-    let pool = ReadPool::new("readpool", read_pool_cfg, || {
-        || ReadPoolContext::new(pd_worker.scheduler())
-    });
-    let cop = Endpoint::new(cfg, store.get_engine(), pool);
+
+    let pool = readpool_impl::build_read_pool_for_test(
+        &CoprReadPoolConfig::default_for_test(),
+        store.get_engine(),
+    );
+    let cop = Endpoint::new(cfg, pool);
     (store, cop)
 }
 
@@ -117,7 +93,7 @@ pub fn init_data_with_commit(
     commit: bool,
 ) -> (Store<RocksEngine>, Endpoint<RocksEngine>) {
     let engine = TestEngineBuilder::new().build().unwrap();
-    init_data_with_engine_and_commit(Context::new(), engine, tbl, vals, commit)
+    init_data_with_engine_and_commit(Context::default(), engine, tbl, vals, commit)
 }
 
 // This function will create a Product table and initialize with the specified data.

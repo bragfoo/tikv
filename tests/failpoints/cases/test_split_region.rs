@@ -1,15 +1,5 @@
-// Copyright 2018 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
+
 use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
@@ -19,13 +9,13 @@ use kvproto::raft_serverpb::RaftMessage;
 use raft::eraftpb::MessageType;
 use tikv::raftstore::store::util::is_vote_msg;
 use tikv::raftstore::Result;
-use tikv::util::HandyRwLock;
+use tikv_util::HandyRwLock;
 
 use test_raftstore::*;
 
 #[test]
 fn test_follower_slow_split() {
-    let _guard = ::setup();
+    let _guard = crate::setup();
     let mut cluster = new_node_cluster(0, 3);
     let pd_client = Arc::clone(&cluster.pd_client);
     pd_client.disable_default_operator();
@@ -33,9 +23,9 @@ fn test_follower_slow_split() {
     let region = cluster.get_region(b"");
 
     // Only need peer 1 and 3. Stop node 2 to avoid extra vote messages.
+    cluster.must_transfer_leader(1, new_peer(1, 1));
     pd_client.must_remove_peer(1, new_peer(2, 2));
     cluster.stop_node(2);
-    cluster.must_transfer_leader(1, new_peer(1, 1));
 
     // Use a channel to retrieve start_key and end_key in pre-vote messages.
     let (range_tx, range_rx) = mpsc::channel();
@@ -48,7 +38,10 @@ fn test_follower_slow_split() {
             .allow(1),
         tx: Mutex::new(range_tx),
     };
-    cluster.sim.wl().add_send_filter(1, box prevote_filter);
+    cluster
+        .sim
+        .wl()
+        .add_send_filter(1, Box::new(prevote_filter));
 
     // Ensure pre-vote response is really sended.
     let (tx, rx) = mpsc::channel();
@@ -77,7 +70,7 @@ struct PrevoteRangeFilter {
     tx: Mutex<mpsc::Sender<(Vec<u8>, Vec<u8>)>>,
 }
 
-impl Filter<RaftMessage> for PrevoteRangeFilter {
+impl Filter for PrevoteRangeFilter {
     fn before(&self, msgs: &mut Vec<RaftMessage>) -> Result<()> {
         self.filter.before(msgs)?;
         if let Some(msg) = msgs.iter().filter(|m| is_vote_msg(m.get_message())).last() {

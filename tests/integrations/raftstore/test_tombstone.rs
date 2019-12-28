@@ -1,29 +1,17 @@
-// Copyright 2016 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use protobuf::Message;
-use rocksdb::Writable;
-
 use kvproto::raft_serverpb::{PeerState, RaftMessage, RegionLocalState, StoreIdent};
+use protobuf::Message;
 
+use engine::rocks::util::get_cf_handle;
+use engine::rocks::Writable;
+use engine::CF_RAFT;
+use engine::{Iterable, Mutable, Peekable};
 use test_raftstore::*;
-use tikv::raftstore::store::{keys, Iterable, Mutable, Peekable};
-use tikv::storage::CF_RAFT;
-use tikv::util::rocksdb::get_cf_handle;
 
 fn test_tombstone<T: Simulator>(cluster: &mut Cluster<T>) {
     let pd_client = Arc::clone(&cluster.pd_client);
@@ -75,12 +63,12 @@ fn test_tombstone<T: Simulator>(cluster: &mut Cluster<T>) {
     assert_eq!(existing_kvs[0].0.as_slice(), keys::STORE_IDENT_KEY);
     assert_eq!(existing_kvs[1].0, keys::region_state_key(r1));
 
-    let mut ident = StoreIdent::new();
+    let mut ident = StoreIdent::default();
     ident.merge_from_bytes(&existing_kvs[0].1).unwrap();
     assert_eq!(ident.get_store_id(), 2);
     assert_eq!(ident.get_cluster_id(), cluster.id());
 
-    let mut state = RegionLocalState::new();
+    let mut state = RegionLocalState::default();
     state.merge_from_bytes(&existing_kvs[1].1).unwrap();
     assert_eq!(state.get_state(), PeerState::Tombstone);
 
@@ -91,7 +79,7 @@ fn test_tombstone<T: Simulator>(cluster: &mut Cluster<T>) {
     assert!(conf_ver == 4 || conf_ver == 3);
 
     // Send a stale raft message to peer (2, 2)
-    let mut raft_msg = RaftMessage::new();
+    let mut raft_msg = RaftMessage::default();
 
     raft_msg.set_region_id(r1);
     // Use an invalid from peer to ignore gc peer message.
@@ -156,7 +144,7 @@ fn test_fast_destroy<T: Simulator>(cluster: &mut Cluster<T>) {
     cluster.must_put(b"k2", b"v2");
 
     // start node again.
-    cluster.run_node(3);
+    cluster.run_node(3).unwrap();
 
     // add new peer in node 3
     pd_client.must_add_peer(1, new_peer(3, 4));
@@ -222,7 +210,7 @@ fn test_readd_peer<T: Simulator>(cluster: &mut Cluster<T>) {
 
     // Stale gc message should be ignored.
     let epoch = pd_client.get_region_epoch(r1);
-    let mut gc_msg = RaftMessage::new();
+    let mut gc_msg = RaftMessage::default();
     gc_msg.set_region_id(r1);
     gc_msg.set_from_peer(new_peer(1, 1));
     gc_msg.set_to_peer(new_peer(2, 2));
@@ -278,7 +266,7 @@ fn test_server_stale_meta() {
 
     // avoid TIMEWAIT
     sleep_ms(500);
-    cluster.start();
+    cluster.start().unwrap();
 
     cluster.must_put(b"k1", b"v1");
     must_get_equal(&engine_3, b"k1", b"v1");

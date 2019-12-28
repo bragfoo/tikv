@@ -18,6 +18,15 @@
 ## timestamp appended to its name and a new file will be created.
 # log-rotation-timespan = "24h"
 
+## Size of log file that triggers the log rotation.
+## Once the size of log file exceeds the threshold value, the log file will be rotated
+## and place the old log file in a new file named by orginal file name subbfixed by a timestamp.
+# log-rotation-size = "300MB"
+
+## The interval at which to refresh the local config
+## Set it small are good to debug and tuning.
+# refresh-config-interval = "30s"
+
 [readpool.storage]
 ## Size of the thread pool for high-priority operations.
 # high-concurrency = 4
@@ -64,6 +73,14 @@
 ## If not set, `addr` will be used.
 # advertise-addr = ""
 
+## Status address.
+## This is used for reporting the status of TiKV directly through the HTTP address.
+## Empty string means disabling it.
+# status-addr = "127.0.0.1:20180"
+
+## Set the maximum number of worker threads for the status report HTTP service.
+# status-thread-pool-size = 1
+
 ## Compression type for gRPC channel: none, deflate or gzip.
 # grpc-compression-type = "none"
 
@@ -72,6 +89,11 @@
 
 ## The number of max concurrent streams/requests on a client connection.
 # grpc-concurrent-stream = 1024
+
+## Limit the memory size can be used by gRPC. Default is unlimited.
+## gRPC usually works well to reclaim memory by itself. Limit the memory in case OOM
+## is observed. Note that limit the usage can lead to potential stall.
+# grpc-memory-pool-quota = "32G"
 
 ## The number of connections with each TiKV server to send Raft messages.
 # grpc-raft-conn-num = 10
@@ -102,15 +124,24 @@
 ## It should be set based on your disk performance.
 # snap-max-write-bytes-per-sec = "100MB"
 
+## Whether to enable request batch.
+# enable-request-batch = true
+
+## Whether to collect batch across commands.
+## When disabled, wait duration is ignored. When enabled, collect batch for specified duration
+## when load is high.
+# request-batch-enable-cross-command = true
+
+## Wait duration before each request batch is processed. Wait is triggered when cross-command
+## option is enabled and system load is high.
+# request-batch-wait-duration = "1ms"
+
 ## Attributes about this server, e.g. `{ zone = "us-west-1", disk = "ssd" }`.
 # labels = {}
 
 [storage]
 ## The path to RocksDB directory.
 # data-dir = "/tmp/tikv/store"
-
-## Internal notify capacity of Scheduler's channel.
-# scheduler-notify-capacity = 10240
 
 ## The number of slots in Scheduler latches, which controls write concurrency.
 ## In most cases you can use the default value. When importing data, you can set it to a larger
@@ -126,22 +157,47 @@
 ## When the pending write bytes exceeds this threshold, the "scheduler too busy" error is displayed.
 # scheduler-pending-write-threshold = "100MB"
 
+[storage.block-cache]
+## Whether to create a shared block cache for all RocksDB column families.
+##
+## Block cache is used by RocksDB to cache uncompressed blocks. Big block cache can speed up read.
+## It is recommended to turn on shared block cache. Since only the total cache size need to be
+## set, it is easier to config. In most cases it should be able to auto-balance cache usage
+## between column families with standard LRU algorithm.
+##
+## The rest of config in the storage.block-cache session is effective only when shared block cache
+## is on.
+# shared = true
+
+## Size of the shared block cache. Normally it should be tuned to 30%-50% of system's total memory.
+## When the config is not set, it is decided by the sum of the following fields or their default
+## value:
+##   * rocksdb.defaultcf.block-cache-size or 25% of system's total memory
+##   * rocksdb.writecf.block-cache-size   or 15% of system's total memory
+##   * rocksdb.lockcf.block-cache-size    or  2% of system's total memory
+##   * raftdb.defaultcf.block-cache-size  or  2% of system's total memory
+##
+## To deploy multiple TiKV nodes on a single physical machine, configure this parameter explicitly.
+## Otherwise, the OOM problem might occur in TiKV.
+# capacity = "1GB"
+
 [pd]
 ## PD endpoints.
 # endpoints = []
 
-[metric]
-## Prometheus client push interval.
-## Setting the value to 0s stops Prometheus client from pushing.
-# interval = "15s"
+## The interval at which to retry a PD connection initialization.
+## Default is 300ms.
+# retry-interval = "300ms"
 
-## Prometheus PushGateway address.
-## Leaving it empty stops Prometheus client from pushing.
-# address = ""
+## If the client observes an error, it can can skip reporting it except every `n` times.
+## Set to 1 to disable this feature.
+## Default is 10.
+# retry-log-every = 10
 
-## Prometheus client push job name.
-## Note: A node id will automatically append, e.g., "tikv_1".
-# job = "tikv"
+## The maximum number of times to retry a PD connection initialization.
+## Set to 0 to disable retry.
+## Default is -1, meaning isize::MAX times.
+# retry-max-count = -1
 
 [raftstore]
 ## Whether to force to flush logs.
@@ -236,11 +292,17 @@
 ## Interval to clean up import SST files.
 # cleanup-import-sst-interval = "10m"
 
+## Use how many threads to handle log apply
+# apply-pool-size = 2
+
+## Use how many threads to handle raft messages
+# store-pool-size = 2
+
 [coprocessor]
 ## When it is set to `true`, TiKV will try to split a Region with table prefix if that Region
 ## crosses tables.
 ## It is recommended to turn off this option if there will be a large number of tables created.
-# split-region-on-table = true
+# split-region-on-table = false
 
 ## One split check produces several split keys in batch. This config limits the number of produced
 ## split keys in one batch.
@@ -261,15 +323,21 @@
 [rocksdb]
 ## Maximum number of threads of RocksDB background jobs.
 ## The background tasks include compaction and flush. For detailed information why RocksDB needs to
-## do compaction, see RocksDB-related materials. When write traffic (like the importing data size)
-## is big, it is recommended to enable more threads. But set the number of the enabled threads
-## smaller than that of CPU cores. For example, when importing data, for a machine with a 32-core
-## CPU, set the value to 28.
+## do compaction, see RocksDB-related materials. RocksDB will adjust flush and compaction threads
+## according to the formula:
+##   max_flushes = max_flushes = max(1, max_background_jobs / 4)
+##   max_compactions = max(1, max_background_jobs - max_flushes)
+## When write traffic (like the importing data size)  is big, it is recommended to enable more
+## threads. But set the number of the enabled threads  smaller than that of CPU cores. For example,
+## when importing data, for a machine with a 32-core CPU, set the value to 28.
+## The default value is set to 8 or CPU_NUM - 1, whichever is smaller.
 # max-background-jobs = 8
 
 ## Represents the maximum number of threads that will concurrently perform a sub-compaction job by
 ## breaking it into multiple, smaller ones running simultaneously.
-# max-sub-compactions = 1
+## The default value is set to 3 or the largest number to allow for two compactions, whichever is
+## smaller.
+# max-sub-compactions = 3
 
 ## Number of open files that can be used by the DB.
 ## Value -1 means files opened are always kept open and RocksDB will prefetch index and filter
@@ -281,7 +349,7 @@
 
 ## Max size of RocksDB's MANIFEST file.
 ## For detailed explanation, please refer to https://github.com/facebook/rocksdb/wiki/MANIFEST
-# max-manifest-file-size = "20MB"
+# max-manifest-file-size = "128MB"
 
 ## If the value is `true`, the database will be created if it is missing.
 # create-if-missing = true
@@ -343,7 +411,19 @@
 ## Compaction and flush can cause terrible spikes if they exceed a certain threshold. Consider
 ## setting this to 50% ~ 80% of the disk throughput for a more stable result. However, in heavy
 ## write workload, limiting compaction and flush speed can cause write stalls too.
+## 1. rate-bytes-per-sec is the only parameter you want to set most of the time. It controls the
+##    total write rate of compaction and flush in bytes per second. Currently, RocksDB does not
+##    enforce rate limit for anything other than flush and compaction, e.g. write to WAL.
+## 2. rate-limiter-mode indicates which types of operations count against the limit.
+##    1 : ReadOnly
+##    2 : WriteOnly
+##    3 : AllIo
+## 3. auto_tuned enables dynamic adjustment of rate limit within the range
+##    [rate_bytes_per_sec / 20, rate_bytes_per_sec], according to the recent demand for background I/O.
 # rate-bytes-per-sec = 0
+# rate-limiter-mode = 2
+# auto-tuned = false
+
 
 ## Enable or disable the pipelined write.
 # enable-pipelined-write = true
@@ -373,6 +453,17 @@
 ## If it is not empty, the log files will be in the specified directory, and the DB data directory's
 ## absolute path will be used as the log file name's prefix.
 # info-log-dir = ""
+
+## Options for `Titan`.
+[rocksdb.titan]
+## Enables or disables `Titan`. Note that Titan is still an experimental feature. Once
+## enabled, it can't fall back. Forced fallback may result in data loss.
+## default: false
+# enabled = false
+
+## Maximum number of threads of `Titan` background gc jobs.
+# default: 1
+# max-background-gc = 1
 
 ## Options for "Default" Column Family, which stores actual user data.
 [rocksdb.defaultcf]
@@ -478,13 +569,6 @@
 ## 3 : MinOverlappingRatio
 # compaction-pri = 3
 
-## Block cache used to cache uncompressed blocks.
-## Big block-cache can speed up read. Normally it should be tuned to 30%-50% system's total memory.
-## When the config is not set, TiKV sets the value to 40% of the system memory size.
-## To deploy multiple TiKV nodes on one physical machine, configure this parameter explicitly.
-## Otherwise, the OOM problem might occur in TiKV.
-# block-cache-size = "1GB"
-
 ## Indicating if we'd put index/filter blocks to the block cache.
 ## If not specified, each "table reader" object will pre-load index/filter block during table
 ## initialization.
@@ -512,6 +596,44 @@
 ## while using `Raw` mode.
 # optimize-filters-for-hits = true
 
+## Options for "Default" Column Family for `Titan`.
+[rocksdb.defaultcf.titan]
+## The smallest value to store in blob files. Value smaller than
+## this threshold will be inlined in base DB.
+## default: 1KB
+# min-blob-size = "1KB"
+
+## The compression algorithm used to compress data in blob files.
+## Compression method.
+##   no:     kNoCompression
+##   snappy: kSnappyCompression
+##   zlib:   kZlibCompression
+##   bzip2:  kBZip2Compression
+##   lz4:    kLZ4Compression
+##   lz4hc:  kLZ4HCCompression
+##   zstd:   kZSTD
+# default: lz4
+# blob-file-compression = "lz4"
+
+## Specifics cache size for blob records
+# default: 0
+# blob-cache-size = "0GB"
+
+## If the ratio of discardable size of a blob file is larger than
+## this threshold, the blob file will be GCed out.
+# default: 0.5
+# discardable-ratio = 0.5
+
+## The mode used to process blob files. In read-only mode Titan
+## stops writing value into blob log. In fallback mode Titan
+## converts blob index into real value on flush and compaction.
+## This option is especially useful for downgrading Titan.
+##   default:   kNormal
+##   read-only: kReadOnly
+##   fallback:  kFallback
+# default: normal
+# blob-run-mode = "normal"
+
 ## Options for "Write" Column Family, which stores MVCC commit information
 [rocksdb.writecf]
 ## Recommend to set it the same as `rocksdb.defaultcf.compression-per-level`.
@@ -526,13 +648,6 @@
 ## Recommend to set it the same as `rocksdb.defaultcf.max-bytes-for-level-base`.
 # max-bytes-for-level-base = "512MB"
 # target-file-size-base = "8MB"
-
-## In normal cases, this config should be tuned to 10%-30% of the system's total memory.
-## When this config is not set, TiKV sets it to 15% of the system memory size.
-## To deploy multiple TiKV nodes on a single physical machine, configure this parameter explicitly.
-## The related data of the version information (MVCC) and the index-related data are recorded in
-## Write CF. In scenarios that include many single table indexes, set this parameter value higher.
-# block-cache-size = "256MB"
 
 # level0-file-num-compaction-trigger = 4
 # level0-slowdown-writes-trigger = 20
@@ -552,7 +667,6 @@
 # min-write-buffer-number-to-merge = 1
 # max-bytes-for-level-base = "128MB"
 # target-file-size-base = "8MB"
-# block-cache-size = "256MB"
 # level0-file-num-compaction-trigger = 1
 # level0-slowdown-writes-trigger = 20
 # level0-stop-writes-trigger = 36
@@ -564,8 +678,8 @@
 # optimize-filters-for-hits = false
 
 [raftdb]
-# max-background-jobs = 2
-# max-sub-compactions = 1
+# max-background-jobs = 4
+# max-sub-compactions = 2
 # max-open-files = 40960
 # max-manifest-file-size = "20MB"
 # create-if-missing = true
@@ -601,10 +715,6 @@
 # max-bytes-for-level-base = "512MB"
 # target-file-size-base = "8MB"
 
-## Generally, you can set it from 256MB to 2GB. In most cases, you can use the default value. But
-## if the system resources are adequate, you can set it higher.
-# block-cache-size = "256MB"
-
 # level0-file-num-compaction-trigger = 4
 # level0-slowdown-writes-trigger = 20
 # level0-stop-writes-trigger = 36
@@ -627,3 +737,25 @@
 
 ## Stream channel window size, stream will be blocked on channel full.
 # stream-channel-window = 128
+
+[pessimistic-txn]
+## Enable pessimistic transaction
+# enabled = true
+
+## The default and maximum delay in milliseconds before responding to TiDB when pessimistic
+## transactions encounter locks
+# wait-for-lock-timeout = 3000
+
+## If more than one transaction is waiting for the same lock, only the one with smallest
+## start timestamp will be waked up immediately when the lock is released. Others will
+## be waked up after `wake_up_delay_duration(ms)` to reduce contention and make the oldest
+## one more likely acquires the lock.
+# wake-up-delay-duration = 100
+
+[gc]
+## The number of keys to GC in one batch.
+# batch-keys = 512
+
+## Max bytes that GC worker can write to rocksdb in one second.
+## If it is set to 0, there is no limit.
+# max-write-bytes-per-sec = "0"

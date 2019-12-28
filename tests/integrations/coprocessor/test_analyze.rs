@@ -1,20 +1,9 @@
-// Copyright 2017 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
 use kvproto::coprocessor::{KeyRange, Request};
 use kvproto::kvrpcpb::{Context, IsolationLevel};
-use protobuf::{Message, RepeatedField};
-use tipb::analyze::{
+use protobuf::Message;
+use tipb::{
     AnalyzeColumnsReq, AnalyzeColumnsResp, AnalyzeIndexReq, AnalyzeIndexResp, AnalyzeReq,
     AnalyzeType,
 };
@@ -23,10 +12,11 @@ use test_coprocessor::*;
 
 pub const REQ_TYPE_ANALYZE: i64 = 104;
 
-fn new_analyze_req(data: Vec<u8>, range: KeyRange) -> Request {
-    let mut req = Request::new();
+fn new_analyze_req(data: Vec<u8>, range: KeyRange, start_ts: u64) -> Request {
+    let mut req = Request::default();
     req.set_data(data);
-    req.set_ranges(RepeatedField::from_vec(vec![range]));
+    req.set_ranges(vec![range].into());
+    req.set_start_ts(start_ts);
     req.set_tp(REQ_TYPE_ANALYZE);
     req
 }
@@ -39,20 +29,20 @@ fn new_analyze_column_req(
     cm_sketch_depth: i32,
     cm_sketch_width: i32,
 ) -> Request {
-    let mut col_req = AnalyzeColumnsReq::new();
-    col_req.set_columns_info(RepeatedField::from_vec(table.get_table_columns()));
+    let mut col_req = AnalyzeColumnsReq::default();
+    col_req.set_columns_info(table.columns_info().into());
     col_req.set_bucket_size(bucket_size);
     col_req.set_sketch_size(fm_sketch_size);
     col_req.set_sample_size(sample_size);
     col_req.set_cmsketch_depth(cm_sketch_depth);
     col_req.set_cmsketch_width(cm_sketch_width);
-    let mut analy_req = AnalyzeReq::new();
+    let mut analy_req = AnalyzeReq::default();
     analy_req.set_tp(AnalyzeType::TypeColumn);
-    analy_req.set_start_ts(next_id() as u64);
     analy_req.set_col_req(col_req);
     new_analyze_req(
         analy_req.write_to_bytes().unwrap(),
-        table.get_select_range(),
+        table.get_record_range_all(),
+        next_id() as u64,
     )
 }
 
@@ -63,18 +53,18 @@ fn new_analyze_index_req(
     cm_sketch_depth: i32,
     cm_sketch_width: i32,
 ) -> Request {
-    let mut idx_req = AnalyzeIndexReq::new();
+    let mut idx_req = AnalyzeIndexReq::default();
     idx_req.set_num_columns(2);
     idx_req.set_bucket_size(bucket_size);
     idx_req.set_cmsketch_depth(cm_sketch_depth);
     idx_req.set_cmsketch_width(cm_sketch_width);
-    let mut analy_req = AnalyzeReq::new();
+    let mut analy_req = AnalyzeReq::default();
     analy_req.set_tp(AnalyzeType::TypeIndex);
-    analy_req.set_start_ts(next_id() as u64);
     analy_req.set_idx_req(idx_req);
     new_analyze_req(
         analy_req.write_to_bytes().unwrap(),
-        table.get_index_range(idx),
+        table.get_index_range_all(idx),
+        next_id() as u64,
     )
 }
 
@@ -88,22 +78,22 @@ fn test_analyze_column_with_lock() {
     ];
 
     let product = ProductTable::new();
-    for &iso_level in &[IsolationLevel::SI, IsolationLevel::RC] {
+    for &iso_level in &[IsolationLevel::Si, IsolationLevel::Rc] {
         let (_, endpoint) = init_data_with_commit(&product, &data, false);
 
-        let mut req = new_analyze_column_req(&product.table, 3, 3, 3, 4, 32);
-        let mut ctx = Context::new();
+        let mut req = new_analyze_column_req(&product, 3, 3, 3, 4, 32);
+        let mut ctx = Context::default();
         ctx.set_isolation_level(iso_level);
         req.set_context(ctx);
 
         let resp = handle_request(&endpoint, req);
         match iso_level {
-            IsolationLevel::SI => {
+            IsolationLevel::Si => {
                 assert!(resp.get_data().is_empty(), "{:?}", resp);
                 assert!(resp.has_locked(), "{:?}", resp);
             }
-            IsolationLevel::RC => {
-                let mut analyze_resp = AnalyzeColumnsResp::new();
+            IsolationLevel::Rc => {
+                let mut analyze_resp = AnalyzeColumnsResp::default();
                 analyze_resp.merge_from_bytes(resp.get_data()).unwrap();
                 let hist = analyze_resp.get_pk_hist();
                 assert!(hist.get_buckets().is_empty());
@@ -125,19 +115,16 @@ fn test_analyze_column() {
     let product = ProductTable::new();
     let (_, endpoint) = init_data_with_commit(&product, &data, true);
 
-    let req = new_analyze_column_req(&product.table, 3, 3, 3, 4, 32);
+    let req = new_analyze_column_req(&product, 3, 3, 3, 4, 32);
     let resp = handle_request(&endpoint, req);
     assert!(!resp.get_data().is_empty());
-    let mut analyze_resp = AnalyzeColumnsResp::new();
+    let mut analyze_resp = AnalyzeColumnsResp::default();
     analyze_resp.merge_from_bytes(resp.get_data()).unwrap();
     let hist = analyze_resp.get_pk_hist();
     assert_eq!(hist.get_buckets().len(), 2);
     assert_eq!(hist.get_ndv(), 4);
     let collectors = analyze_resp.get_collectors().to_vec();
-    assert_eq!(
-        collectors.len(),
-        product.table.get_table_columns().len() - 1
-    );
+    assert_eq!(collectors.len(), product.columns_info().len() - 1);
     assert_eq!(collectors[0].get_null_count(), 1);
     assert_eq!(collectors[0].get_count(), 3);
     let rows = collectors[0].get_cm_sketch().get_rows();
@@ -156,22 +143,22 @@ fn test_analyze_index_with_lock() {
     ];
 
     let product = ProductTable::new();
-    for &iso_level in &[IsolationLevel::SI, IsolationLevel::RC] {
+    for &iso_level in &[IsolationLevel::Si, IsolationLevel::Rc] {
         let (_, endpoint) = init_data_with_commit(&product, &data, false);
 
-        let mut req = new_analyze_index_req(&product.table, 3, product.name.index, 4, 32);
-        let mut ctx = Context::new();
+        let mut req = new_analyze_index_req(&product, 3, product["name"].index, 4, 32);
+        let mut ctx = Context::default();
         ctx.set_isolation_level(iso_level);
         req.set_context(ctx);
 
         let resp = handle_request(&endpoint, req);
         match iso_level {
-            IsolationLevel::SI => {
+            IsolationLevel::Si => {
                 assert!(resp.get_data().is_empty(), "{:?}", resp);
                 assert!(resp.has_locked(), "{:?}", resp);
             }
-            IsolationLevel::RC => {
-                let mut analyze_resp = AnalyzeIndexResp::new();
+            IsolationLevel::Rc => {
+                let mut analyze_resp = AnalyzeIndexResp::default();
                 analyze_resp.merge_from_bytes(resp.get_data()).unwrap();
                 let hist = analyze_resp.get_hist();
                 assert!(hist.get_buckets().is_empty());
@@ -193,10 +180,10 @@ fn test_analyze_index() {
     let product = ProductTable::new();
     let (_, endpoint) = init_data_with_commit(&product, &data, true);
 
-    let req = new_analyze_index_req(&product.table, 3, product.name.index, 4, 32);
+    let req = new_analyze_index_req(&product, 3, product["name"].index, 4, 32);
     let resp = handle_request(&endpoint, req);
     assert!(!resp.get_data().is_empty());
-    let mut analyze_resp = AnalyzeIndexResp::new();
+    let mut analyze_resp = AnalyzeIndexResp::default();
     analyze_resp.merge_from_bytes(resp.get_data()).unwrap();
     let hist = analyze_resp.get_hist();
     assert_eq!(hist.get_ndv(), 4);
@@ -218,11 +205,11 @@ fn test_invalid_range() {
 
     let product = ProductTable::new();
     let (_, endpoint) = init_data_with_commit(&product, &data, true);
-    let mut req = new_analyze_index_req(&product.table, 3, product.name.index, 4, 32);
-    let mut key_range = KeyRange::new();
+    let mut req = new_analyze_index_req(&product, 3, product["name"].index, 4, 32);
+    let mut key_range = KeyRange::default();
     key_range.set_start(b"xxx".to_vec());
     key_range.set_end(b"zzz".to_vec());
-    req.set_ranges(RepeatedField::from_vec(vec![key_range]));
+    req.set_ranges(vec![key_range].into());
     let resp = handle_request(&endpoint, req);
     assert!(!resp.get_other_error().is_empty());
 }
