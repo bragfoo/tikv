@@ -14,8 +14,6 @@ pub struct BufferVec {
 
 impl std::fmt::Debug for BufferVec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        use hex::ToHex;
-
         write!(f, "[")?;
         for (i, item) in self.iter().enumerate() {
             if i != 0 {
@@ -24,7 +22,7 @@ impl std::fmt::Debug for BufferVec {
             if item.is_empty() {
                 write!(f, "null")?;
             } else {
-                item.write_hex_upper(f)?;
+                write!(f, "{}", hex::encode_upper(item))?;
             }
         }
         write!(f, "]")
@@ -352,7 +350,7 @@ impl<'a> Iterator for Iter<'a> {
     type Item = &'a [u8];
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.nth(0)
+        Self::nth(self, 0)
     }
 
     #[inline]
@@ -376,18 +374,24 @@ impl<'a> Iterator for Iter<'a> {
     }
 
     fn nth(&mut self, n: usize) -> Option<Self::Item> {
-        if n + 1 < self.offsets.len() {
-            let begin_offset = self.offsets[n];
-            let end_offset = self.offsets[n + 1];
-            self.offsets = &self.offsets[n + 1..];
-            Some(&self.data[begin_offset..end_offset])
-        } else if n + 1 == self.offsets.len() {
-            let begin_offset = self.offsets[n];
-            self.offsets = &[];
-            Some(&self.data[begin_offset..])
-        } else {
-            self.offsets = &[];
-            None
+        use std::cmp::Ordering::*;
+
+        match (n + 1).cmp(&self.offsets.len()) {
+            Less => {
+                let begin_offset = self.offsets[n];
+                let end_offset = self.offsets[n + 1];
+                self.offsets = &self.offsets[n + 1..];
+                Some(&self.data[begin_offset..end_offset])
+            }
+            Equal => {
+                let begin_offset = self.offsets[n];
+                self.offsets = &[];
+                Some(&self.data[begin_offset..])
+            }
+            Greater => {
+                self.offsets = &[];
+                None
+            }
         }
     }
 }
@@ -651,7 +655,7 @@ mod tests {
         assert_eq!(v3.total_len(), 3);
         assert_eq!(format!("{:?}", v3), "[null, null, null, AABB0C, null]");
 
-        let mut v3 = v2.clone();
+        let mut v3 = v2;
         v3.shift(2);
         v3.copy_from(&v1);
         assert_eq!(v3.len(), 4);
@@ -714,7 +718,7 @@ mod tests {
         assert_eq!(v3.total_len(), 3);
         assert_eq!(format!("{:?}", v3), "[null, AABB0C]");
 
-        let mut v3 = v1.clone();
+        let mut v3 = v1;
         v3.copy_n_from(&v2, 2);
         assert_eq!(v3.len(), 4);
         assert_eq!(v3.total_len(), 5);
@@ -813,7 +817,7 @@ mod tests {
         v2.copy_from(&v);
         assert_eq!(format!("{:?}", v2), "[null, AA00, null, null, BB00A0]");
 
-        let mut v2 = v.clone();
+        let mut v2 = v;
         v2.retain_by_array(&[false, false, false, true]);
         assert_eq!(format!("{:?}", v2), "[BB00A0]");
 
@@ -838,9 +842,9 @@ mod tests {
         assert!(it.last().unwrap().is_empty());
 
         let mut it = v.iter();
-        assert!(it.nth(0).unwrap().is_empty());
+        assert!(it.next().unwrap().is_empty());
         assert_eq!(it.count(), 5);
-        assert_eq!(it.nth(0).unwrap(), &[0xAA, 0xBB, 0x0C]);
+        assert_eq!(it.next().unwrap(), &[0xAA, 0xBB, 0x0C]);
         assert_eq!(it.count(), 4);
         assert_eq!(it.nth(2).unwrap(), &[0x00]);
         assert_eq!(it.count(), 1);
@@ -858,7 +862,7 @@ mod tests {
         assert_eq!(it.count(), 0);
         assert_eq!(it.next(), None);
         assert_eq!(it.count(), 0);
-        assert_eq!(it.nth(0), None);
+        assert_eq!(it.next(), None);
         assert_eq!(it.last(), None);
 
         let mut it = v.iter();
